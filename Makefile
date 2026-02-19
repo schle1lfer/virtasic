@@ -8,9 +8,9 @@ CFLAGS = -Wall -Wextra
 CXXFLAGS = -Wall -Wextra
 LDFLAGS =
 
-# sudo apt-get install libnl-3-dev libnl-genl-3-dev libnl-genl-3-dev
+# sudo apt-get install libnl-3-dev libnl-genl-3-dev libnl-route-3-dev
 STATIC_LIBS =
-DYNAMIC_LIBS = -lpthread -ldl -lnl-3 -lnl-genl-3
+DYNAMIC_LIBS = -lpthread -ldl -lnl-3 -lnl-genl-3 -lnl-route-3
 
 TARGET_DAEMON = virtasic
 
