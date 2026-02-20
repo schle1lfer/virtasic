@@ -5,6 +5,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
+#include <time.h>
 #include <linux/netlink.h>      /* keep only one copy */
 #include <linux/if.h>
 #include <linux/if_ether.h>
@@ -21,6 +22,42 @@
 
 #define PORT 8888
 #define BUFFER_SIZE 1024
+
+/*
+ * ---------------------------------------------------------------------------
+ * Netlink API call logging helpers
+ *
+ * NL_CALL_RET(var, call, fn_name, params_fmt, ...)
+ *   Executes `call`, assigns the result to `var`, then prints the function
+ *   name, formatted parameter description, and elapsed wall-clock time (ms).
+ *
+ * NL_CALL_VOID(call, fn_name, params_fmt, ...)
+ *   Same as NL_CALL_RET but for calls whose return value is not used.
+ * ---------------------------------------------------------------------------
+ */
+#define NL_CALL_RET(var, call, fn_name, params_fmt, ...)                    \
+    do {                                                                     \
+        struct timespec _nl_t0, _nl_t1;                                     \
+        clock_gettime(CLOCK_MONOTONIC, &_nl_t0);                            \
+        (var) = (call);                                                      \
+        clock_gettime(CLOCK_MONOTONIC, &_nl_t1);                            \
+        double _nl_ms = (_nl_t1.tv_sec  - _nl_t0.tv_sec)  * 1000.0         \
+                      + (_nl_t1.tv_nsec - _nl_t0.tv_nsec) / 1.0e6;         \
+        printf("[NETLINK] %s(" params_fmt ") => %.3f ms\n",                 \
+               fn_name, ##__VA_ARGS__, _nl_ms);                             \
+    } while (0)
+
+#define NL_CALL_VOID(call, fn_name, params_fmt, ...)                        \
+    do {                                                                     \
+        struct timespec _nl_t0, _nl_t1;                                     \
+        clock_gettime(CLOCK_MONOTONIC, &_nl_t0);                            \
+        (call);                                                              \
+        clock_gettime(CLOCK_MONOTONIC, &_nl_t1);                            \
+        double _nl_ms = (_nl_t1.tv_sec  - _nl_t0.tv_sec)  * 1000.0         \
+                      + (_nl_t1.tv_nsec - _nl_t0.tv_nsec) / 1.0e6;         \
+        printf("[NETLINK] %s(" params_fmt ") => %.3f ms\n",                 \
+               fn_name, ##__VA_ARGS__, _nl_ms);                             \
+    } while (0)
 
 /* Forward declarations */
 int get_words(const char* str, char*** words, int* cnt);
@@ -181,6 +218,8 @@ int create_vlan(const char *iface_name, int vlan_id)
     struct nlattr *linkinfo, *data;
     char vlan_ifname[IFNAMSIZ];
     int parent_idx;
+    int _nl_err;
+    const char *_nl_errmsg;
 
     parent_idx = get_iface_index(iface_name);
     if (parent_idx < 0)
@@ -189,42 +228,56 @@ int create_vlan(const char *iface_name, int vlan_id)
         return -1;
     }
 
-    sock = nl_socket_alloc();
+    NL_CALL_RET(sock, nl_socket_alloc(),
+                "nl_socket_alloc", "");
     if (!sock)
     {
         perror("nl_socket_alloc");
         return -1;
     }
 
-    if (nl_connect(sock, NETLINK_ROUTE) < 0)
+    NL_CALL_RET(_nl_err, nl_connect(sock, NETLINK_ROUTE),
+                "nl_connect", "sock=%p, protocol=NETLINK_ROUTE", (void *)sock);
+    if (_nl_err < 0)
     {
         perror("nl_connect");
-        nl_socket_free(sock);
+        NL_CALL_VOID(nl_socket_free(sock),
+                     "nl_socket_free", "sock=%p", (void *)sock);
         return -1;
     }
 
     snprintf(vlan_ifname, sizeof(vlan_ifname), "%s.%d", iface_name, vlan_id);
 
-    msg = nlmsg_alloc();
+    NL_CALL_RET(msg, nlmsg_alloc(),
+                "nlmsg_alloc", "");
     if (!msg)
     {
         perror("nlmsg_alloc");
-        nl_socket_free(sock);
+        NL_CALL_VOID(nl_socket_free(sock),
+                     "nl_socket_free", "sock=%p", (void *)sock);
         return -1;
     }
 
-    nlh = nlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, RTM_NEWLINK,
-                    sizeof(struct ifinfomsg),
-                    NLM_F_REQUEST | NLM_F_CREATE | NLM_F_EXCL);
+    NL_CALL_RET(nlh,
+                nlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, RTM_NEWLINK,
+                          sizeof(struct ifinfomsg),
+                          NLM_F_REQUEST | NLM_F_CREATE | NLM_F_EXCL),
+                "nlmsg_put",
+                "msg=%p, port=NL_AUTO_PORT, seq=NL_AUTO_SEQ, type=RTM_NEWLINK,"
+                " len=%zu, flags=NLM_F_REQUEST|NLM_F_CREATE|NLM_F_EXCL",
+                (void *)msg, sizeof(struct ifinfomsg));
     if (!nlh)
     {
         fprintf(stderr, "nlmsg_put failed\n");
-        nlmsg_free(msg);
-        nl_socket_free(sock);
+        NL_CALL_VOID(nlmsg_free(msg),
+                     "nlmsg_free", "msg=%p", (void *)msg);
+        NL_CALL_VOID(nl_socket_free(sock),
+                     "nl_socket_free", "sock=%p", (void *)sock);
         return -1;
     }
 
-    ifi = nlmsg_data(nlh);
+    NL_CALL_RET(ifi, (struct ifinfomsg *)nlmsg_data(nlh),
+                "nlmsg_data", "nlh=%p", (void *)nlh);
     /* Bug fix: was AF_PACKET — the correct family for link creation is AF_UNSPEC */
     ifi->ifi_family = AF_UNSPEC;
     ifi->ifi_type   = 0;
@@ -233,20 +286,32 @@ int create_vlan(const char *iface_name, int vlan_id)
     ifi->ifi_change = 0;
 
     /* New VLAN interface name */
-    if (nla_put_string(msg, IFLA_IFNAME, vlan_ifname) < 0)
+    NL_CALL_RET(_nl_err, nla_put_string(msg, IFLA_IFNAME, vlan_ifname),
+                "nla_put_string",
+                "msg=%p, attr=IFLA_IFNAME, val=\"%s\"",
+                (void *)msg, vlan_ifname);
+    if (_nl_err < 0)
     {
         perror("nla_put IFLA_IFNAME");
-        nlmsg_free(msg);
-        nl_socket_free(sock);
+        NL_CALL_VOID(nlmsg_free(msg),
+                     "nlmsg_free", "msg=%p", (void *)msg);
+        NL_CALL_VOID(nl_socket_free(sock),
+                     "nl_socket_free", "sock=%p", (void *)sock);
         return -1;
     }
 
     /* Bug fix: parent interface index is mandatory for VLAN sub-interfaces */
-    if (nla_put_u32(msg, IFLA_LINK, (uint32_t)parent_idx) < 0)
+    NL_CALL_RET(_nl_err, nla_put_u32(msg, IFLA_LINK, (uint32_t)parent_idx),
+                "nla_put_u32",
+                "msg=%p, attr=IFLA_LINK, val=%u",
+                (void *)msg, (uint32_t)parent_idx);
+    if (_nl_err < 0)
     {
         perror("nla_put IFLA_LINK");
-        nlmsg_free(msg);
-        nl_socket_free(sock);
+        NL_CALL_VOID(nlmsg_free(msg),
+                     "nlmsg_free", "msg=%p", (void *)msg);
+        NL_CALL_VOID(nl_socket_free(sock),
+                     "nl_socket_free", "sock=%p", (void *)sock);
         return -1;
     }
 
@@ -257,54 +322,82 @@ int create_vlan(const char *iface_name, int vlan_id)
      *     IFLA_INFO_DATA
      *       IFLA_VLAN_ID  (u16, not u32)
      */
-    linkinfo = nla_nest_start(msg, IFLA_LINKINFO);
+    NL_CALL_RET(linkinfo, nla_nest_start(msg, IFLA_LINKINFO),
+                "nla_nest_start", "msg=%p, attr=IFLA_LINKINFO", (void *)msg);
     if (!linkinfo)
     {
         fprintf(stderr, "nla_nest_start(IFLA_LINKINFO) failed\n");
-        nlmsg_free(msg);
-        nl_socket_free(sock);
+        NL_CALL_VOID(nlmsg_free(msg),
+                     "nlmsg_free", "msg=%p", (void *)msg);
+        NL_CALL_VOID(nl_socket_free(sock),
+                     "nl_socket_free", "sock=%p", (void *)sock);
         return -1;
     }
 
-    if (nla_put_string(msg, IFLA_INFO_KIND, "vlan") < 0)
+    NL_CALL_RET(_nl_err, nla_put_string(msg, IFLA_INFO_KIND, "vlan"),
+                "nla_put_string",
+                "msg=%p, attr=IFLA_INFO_KIND, val=\"vlan\"",
+                (void *)msg);
+    if (_nl_err < 0)
     {
         perror("nla_put IFLA_INFO_KIND");
-        nlmsg_free(msg);
-        nl_socket_free(sock);
+        NL_CALL_VOID(nlmsg_free(msg),
+                     "nlmsg_free", "msg=%p", (void *)msg);
+        NL_CALL_VOID(nl_socket_free(sock),
+                     "nl_socket_free", "sock=%p", (void *)sock);
         return -1;
     }
 
-    data = nla_nest_start(msg, IFLA_INFO_DATA);
+    NL_CALL_RET(data, nla_nest_start(msg, IFLA_INFO_DATA),
+                "nla_nest_start", "msg=%p, attr=IFLA_INFO_DATA", (void *)msg);
     if (!data)
     {
         fprintf(stderr, "nla_nest_start(IFLA_INFO_DATA) failed\n");
-        nlmsg_free(msg);
-        nl_socket_free(sock);
+        NL_CALL_VOID(nlmsg_free(msg),
+                     "nlmsg_free", "msg=%p", (void *)msg);
+        NL_CALL_VOID(nl_socket_free(sock),
+                     "nl_socket_free", "sock=%p", (void *)sock);
         return -1;
     }
 
     /* Bug fix: VLAN ID is u16 per kernel ABI; was nla_put_u32 */
-    if (nla_put_u16(msg, IFLA_VLAN_ID, (uint16_t)vlan_id) < 0)
+    NL_CALL_RET(_nl_err, nla_put_u16(msg, IFLA_VLAN_ID, (uint16_t)vlan_id),
+                "nla_put_u16",
+                "msg=%p, attr=IFLA_VLAN_ID, val=%u",
+                (void *)msg, (uint16_t)vlan_id);
+    if (_nl_err < 0)
     {
         perror("nla_put IFLA_VLAN_ID");
-        nlmsg_free(msg);
-        nl_socket_free(sock);
+        NL_CALL_VOID(nlmsg_free(msg),
+                     "nlmsg_free", "msg=%p", (void *)msg);
+        NL_CALL_VOID(nl_socket_free(sock),
+                     "nl_socket_free", "sock=%p", (void *)sock);
         return -1;
     }
 
-    nla_nest_end(msg, data);
-    nla_nest_end(msg, linkinfo);
+    NL_CALL_VOID(nla_nest_end(msg, data),
+                 "nla_nest_end", "msg=%p, nested=%p", (void *)msg, (void *)data);
+    NL_CALL_VOID(nla_nest_end(msg, linkinfo),
+                 "nla_nest_end", "msg=%p, nested=%p", (void *)msg, (void *)linkinfo);
 
-    if (nl_send_auto(sock, msg) < 0)
+    NL_CALL_RET(_nl_err, nl_send_auto(sock, msg),
+                "nl_send_auto", "sock=%p, msg=%p", (void *)sock, (void *)msg);
+    if (_nl_err < 0)
     {
-        perror("nl_send_auto");
-        nlmsg_free(msg);
-        nl_socket_free(sock);
+        NL_CALL_RET(_nl_errmsg, nl_geterror(_nl_err),
+                    "nl_geterror", "err=%d", _nl_err);
+        fprintf(stderr, "nl_send_auto failed: %s\n", _nl_errmsg);
+        NL_CALL_VOID(nlmsg_free(msg),
+                     "nlmsg_free", "msg=%p", (void *)msg);
+        NL_CALL_VOID(nl_socket_free(sock),
+                     "nl_socket_free", "sock=%p", (void *)sock);
         return -1;
     }
 
-    nlmsg_free(msg);
-    nl_socket_free(sock);
+    NL_CALL_VOID(nlmsg_free(msg),
+                 "nlmsg_free", "msg=%p", (void *)msg);
+    NL_CALL_VOID(nl_socket_free(sock),
+                 "nl_socket_free", "sock=%p", (void *)sock);
 
     printf("VLAN %d created on interface %s\n", vlan_id, vlan_ifname);
     return 0;
@@ -430,49 +523,83 @@ int cmd_show_interfaces()
     struct nl_sock *sock = NULL;
     struct nl_cache *cache = NULL;
     struct rtnl_link *link = NULL;
+    struct nl_object *_nl_iter = NULL;
+    int _nl_err;
 
-    sock = nl_socket_alloc();
+    NL_CALL_RET(sock, nl_socket_alloc(),
+                "nl_socket_alloc", "");
     if (!sock)
     {
         fprintf(stderr, "cmd_show_interfaces: failed to allocate netlink socket\n");
         return -1;
     }
 
-    if (nl_connect(sock, NETLINK_ROUTE) < 0)
+    NL_CALL_RET(_nl_err, nl_connect(sock, NETLINK_ROUTE),
+                "nl_connect", "sock=%p, protocol=NETLINK_ROUTE", (void *)sock);
+    if (_nl_err < 0)
     {
         fprintf(stderr, "cmd_show_interfaces: failed to connect netlink socket\n");
-        nl_socket_free(sock);
+        NL_CALL_VOID(nl_socket_free(sock),
+                     "nl_socket_free", "sock=%p", (void *)sock);
         return -2;
     }
 
-    if (rtnl_link_alloc_cache(sock, AF_UNSPEC, &cache) < 0)
+    NL_CALL_RET(_nl_err, rtnl_link_alloc_cache(sock, AF_UNSPEC, &cache),
+                "rtnl_link_alloc_cache",
+                "sock=%p, family=AF_UNSPEC, cache=%p",
+                (void *)sock, (void *)cache);
+    if (_nl_err < 0)
     {
         fprintf(stderr, "cmd_show_interfaces: failed to allocate link cache\n");
-        nl_socket_free(sock);
+        NL_CALL_VOID(nl_socket_free(sock),
+                     "nl_socket_free", "sock=%p", (void *)sock);
         return -3;
     }
 
     printf("%-5s  %-20s  %-12s  %s\n", "IDX", "NAME", "TYPE", "FLAGS");
     printf("%-5s  %-20s  %-12s  %s\n", "---", "----", "----", "-----");
 
-    for (link = (struct rtnl_link *)nl_cache_get_first(cache);
-         link != NULL;
-         link = (struct rtnl_link *)nl_cache_get_next((struct nl_object *)link))
+    NL_CALL_RET(_nl_iter, nl_cache_get_first(cache),
+                "nl_cache_get_first", "cache=%p", (void *)cache);
+    link = (struct rtnl_link *)_nl_iter;
+    while (link != NULL)
     {
         char flags_buf[256] = {0};
-        const char *type = rtnl_link_get_type(link);
+        const char *type;
+        unsigned int _flags;
+        int _ifindex;
+        const char *_name;
 
-        rtnl_link_flags2str(rtnl_link_get_flags(link), flags_buf, sizeof(flags_buf));
+        NL_CALL_RET(type, rtnl_link_get_type(link),
+                    "rtnl_link_get_type", "link=%p", (void *)link);
+
+        NL_CALL_RET(_flags, rtnl_link_get_flags(link),
+                    "rtnl_link_get_flags", "link=%p", (void *)link);
+        NL_CALL_VOID(rtnl_link_flags2str(_flags, flags_buf, sizeof(flags_buf)),
+                     "rtnl_link_flags2str",
+                     "flags=%u, buf=%p, len=%zu",
+                     _flags, (void *)flags_buf, sizeof(flags_buf));
+
+        NL_CALL_RET(_ifindex, rtnl_link_get_ifindex(link),
+                    "rtnl_link_get_ifindex", "link=%p", (void *)link);
+        NL_CALL_RET(_name, rtnl_link_get_name(link),
+                    "rtnl_link_get_name", "link=%p", (void *)link);
 
         printf("%-5d  %-20s  %-12s  %s\n",
-               rtnl_link_get_ifindex(link),
-               rtnl_link_get_name(link),
+               _ifindex,
+               _name,
                type ? type : "-",
                flags_buf[0] ? flags_buf : "none");
+
+        NL_CALL_RET(_nl_iter, nl_cache_get_next((struct nl_object *)link),
+                    "nl_cache_get_next", "obj=%p", (void *)link);
+        link = (struct rtnl_link *)_nl_iter;
     }
 
-    nl_cache_free(cache);
-    nl_socket_free(sock);
+    NL_CALL_VOID(nl_cache_free(cache),
+                 "nl_cache_free", "cache=%p", (void *)cache);
+    NL_CALL_VOID(nl_socket_free(sock),
+                 "nl_socket_free", "sock=%p", (void *)sock);
     return 0;
 }
 
@@ -508,8 +635,10 @@ int cmd_rename_interfaces(char* prefix, char* new_prefix)
     struct nl_cache *cache = NULL;
     struct rtnl_link *link = NULL;
     struct rtnl_link *change = NULL;
+    struct nl_object *_nl_iter = NULL;
     int ret_code = 0;
     size_t prefix_len;
+    int _nl_err;
 
     if (!prefix || !new_prefix)
     {
@@ -517,43 +646,62 @@ int cmd_rename_interfaces(char* prefix, char* new_prefix)
         return -1;
     }
 
-    sock = nl_socket_alloc();
+    NL_CALL_RET(sock, nl_socket_alloc(),
+                "nl_socket_alloc", "");
     if (!sock)
     {
         fprintf(stderr, "cmd_rename_interfaces: failed to allocate netlink socket\n");
         return -2;
     }
 
-    if (nl_connect(sock, NETLINK_ROUTE) < 0)
+    NL_CALL_RET(_nl_err, nl_connect(sock, NETLINK_ROUTE),
+                "nl_connect", "sock=%p, protocol=NETLINK_ROUTE", (void *)sock);
+    if (_nl_err < 0)
     {
         fprintf(stderr, "cmd_rename_interfaces: failed to connect netlink socket\n");
-        nl_socket_free(sock);
+        NL_CALL_VOID(nl_socket_free(sock),
+                     "nl_socket_free", "sock=%p", (void *)sock);
         return -3;
     }
 
-    if (rtnl_link_alloc_cache(sock, AF_UNSPEC, &cache) < 0)
+    NL_CALL_RET(_nl_err, rtnl_link_alloc_cache(sock, AF_UNSPEC, &cache),
+                "rtnl_link_alloc_cache",
+                "sock=%p, family=AF_UNSPEC, cache=%p",
+                (void *)sock, (void *)cache);
+    if (_nl_err < 0)
     {
         fprintf(stderr, "cmd_rename_interfaces: failed to allocate link cache\n");
-        nl_socket_free(sock);
+        NL_CALL_VOID(nl_socket_free(sock),
+                     "nl_socket_free", "sock=%p", (void *)sock);
         return -4;
     }
 
     prefix_len = strlen(prefix);
 
-    for (link = (struct rtnl_link *)nl_cache_get_first(cache);
-         link != NULL;
-         link = (struct rtnl_link *)nl_cache_get_next((struct nl_object *)link))
+    NL_CALL_RET(_nl_iter, nl_cache_get_first(cache),
+                "nl_cache_get_first", "cache=%p", (void *)cache);
+    link = (struct rtnl_link *)_nl_iter;
+    while (link != NULL)
     {
-        const char *name = rtnl_link_get_name(link);
+        const char *name;
         char new_name[IFNAMSIZ];
         int err;
 
+        NL_CALL_RET(name, rtnl_link_get_name(link),
+                    "rtnl_link_get_name", "link=%p", (void *)link);
+
         if (!name || strncmp(name, prefix, prefix_len) != 0)
+        {
+            NL_CALL_RET(_nl_iter, nl_cache_get_next((struct nl_object *)link),
+                        "nl_cache_get_next", "obj=%p", (void *)link);
+            link = (struct rtnl_link *)_nl_iter;
             continue;
+        }
 
         snprintf(new_name, sizeof(new_name), "%s%s", new_prefix, name + prefix_len);
 
-        change = rtnl_link_alloc();
+        NL_CALL_RET(change, rtnl_link_alloc(),
+                    "rtnl_link_alloc", "");
         if (!change)
         {
             fprintf(stderr, "cmd_rename_interfaces: failed to allocate change link for %s\n", name);
@@ -561,24 +709,43 @@ int cmd_rename_interfaces(char* prefix, char* new_prefix)
             break;
         }
 
-        rtnl_link_set_name(change, new_name);
+        NL_CALL_VOID(rtnl_link_set_name(change, new_name),
+                     "rtnl_link_set_name", "link=%p, name=\"%s\"",
+                     (void *)change, new_name);
 
-        err = rtnl_link_change(sock, link, change, 0);
+        NL_CALL_RET(err, rtnl_link_change(sock, link, change, 0),
+                    "rtnl_link_change",
+                    "sock=%p, link=%p, change=%p, flags=0",
+                    (void *)sock, (void *)link, (void *)change);
         if (err < 0)
         {
+            const char *_errmsg;
+            NL_CALL_RET(_errmsg, nl_geterror(err),
+                        "nl_geterror", "err=%d", err);
             fprintf(stderr, "cmd_rename_interfaces: rename %s -> %s failed: %s\n",
-                    name, new_name, nl_geterror(err));
-            rtnl_link_put(change);
+                    name, new_name, _errmsg);
+            NL_CALL_VOID(rtnl_link_put(change),
+                         "rtnl_link_put", "link=%p", (void *)change);
             ret_code = -5;
+            NL_CALL_RET(_nl_iter, nl_cache_get_next((struct nl_object *)link),
+                        "nl_cache_get_next", "obj=%p", (void *)link);
+            link = (struct rtnl_link *)_nl_iter;
             continue;
         }
 
         printf("%s -> %s\n", name, new_name);
-        rtnl_link_put(change);
+        NL_CALL_VOID(rtnl_link_put(change),
+                     "rtnl_link_put", "link=%p", (void *)change);
+
+        NL_CALL_RET(_nl_iter, nl_cache_get_next((struct nl_object *)link),
+                    "nl_cache_get_next", "obj=%p", (void *)link);
+        link = (struct rtnl_link *)_nl_iter;
     }
 
-    nl_cache_free(cache);
-    nl_socket_free(sock);
+    NL_CALL_VOID(nl_cache_free(cache),
+                 "nl_cache_free", "cache=%p", (void *)cache);
+    NL_CALL_VOID(nl_socket_free(sock),
+                 "nl_socket_free", "sock=%p", (void *)sock);
     return ret_code;
 }
 
@@ -611,68 +778,110 @@ int cmd_show_vlan()
     struct nl_cache *cache = NULL;
     struct rtnl_link *link = NULL;
     struct rtnl_link *parent_link = NULL;
+    struct nl_object *_nl_iter = NULL;
+    int _nl_err;
 
-    sock = nl_socket_alloc();
+    NL_CALL_RET(sock, nl_socket_alloc(),
+                "nl_socket_alloc", "");
     if (!sock)
     {
         fprintf(stderr, "cmd_show_vlan: failed to allocate netlink socket\n");
         return -1;
     }
 
-    if (nl_connect(sock, NETLINK_ROUTE) < 0)
+    NL_CALL_RET(_nl_err, nl_connect(sock, NETLINK_ROUTE),
+                "nl_connect", "sock=%p, protocol=NETLINK_ROUTE", (void *)sock);
+    if (_nl_err < 0)
     {
         fprintf(stderr, "cmd_show_vlan: failed to connect netlink socket\n");
-        nl_socket_free(sock);
+        NL_CALL_VOID(nl_socket_free(sock),
+                     "nl_socket_free", "sock=%p", (void *)sock);
         return -2;
     }
 
-    if (rtnl_link_alloc_cache(sock, AF_UNSPEC, &cache) < 0)
+    NL_CALL_RET(_nl_err, rtnl_link_alloc_cache(sock, AF_UNSPEC, &cache),
+                "rtnl_link_alloc_cache",
+                "sock=%p, family=AF_UNSPEC, cache=%p",
+                (void *)sock, (void *)cache);
+    if (_nl_err < 0)
     {
         fprintf(stderr, "cmd_show_vlan: failed to allocate link cache\n");
-        nl_socket_free(sock);
+        NL_CALL_VOID(nl_socket_free(sock),
+                     "nl_socket_free", "sock=%p", (void *)sock);
         return -3;
     }
 
     printf("%-20s  %-20s  %-10s  %s\n", "NAME", "PARENT", "VLAN_ID", "FLAGS");
     printf("%-20s  %-20s  %-10s  %s\n", "----", "------", "-------", "-----");
 
-    for (link = (struct rtnl_link *)nl_cache_get_first(cache);
-         link != NULL;
-         link = (struct rtnl_link *)nl_cache_get_next((struct nl_object *)link))
+    NL_CALL_RET(_nl_iter, nl_cache_get_first(cache),
+                "nl_cache_get_first", "cache=%p", (void *)cache);
+    link = (struct rtnl_link *)_nl_iter;
+    while (link != NULL)
     {
         char flags_buf[128] = {0};
         const char *parent_name = "-";
         int parent_idx;
         int vlan_id;
+        int _is_vlan;
+        uint32_t _vlan_flags;
+        const char *_name;
 
-        if (!rtnl_link_is_vlan(link))
+        NL_CALL_RET(_is_vlan, rtnl_link_is_vlan(link),
+                    "rtnl_link_is_vlan", "link=%p", (void *)link);
+        if (!_is_vlan)
+        {
+            NL_CALL_RET(_nl_iter, nl_cache_get_next((struct nl_object *)link),
+                        "nl_cache_get_next", "obj=%p", (void *)link);
+            link = (struct rtnl_link *)_nl_iter;
             continue;
+        }
 
-        vlan_id    = rtnl_link_vlan_get_id(link);
-        parent_idx = rtnl_link_get_link(link);
+        NL_CALL_RET(vlan_id, rtnl_link_vlan_get_id(link),
+                    "rtnl_link_vlan_get_id", "link=%p", (void *)link);
+        NL_CALL_RET(parent_idx, rtnl_link_get_link(link),
+                    "rtnl_link_get_link", "link=%p", (void *)link);
 
-        parent_link = rtnl_link_get(cache, parent_idx);
+        NL_CALL_RET(parent_link, rtnl_link_get(cache, parent_idx),
+                    "rtnl_link_get", "cache=%p, idx=%d", (void *)cache, parent_idx);
         if (parent_link)
-            parent_name = rtnl_link_get_name(parent_link);
+        {
+            NL_CALL_RET(parent_name, rtnl_link_get_name(parent_link),
+                        "rtnl_link_get_name", "link=%p", (void *)parent_link);
+        }
 
-        rtnl_link_vlan_flags2str((int)rtnl_link_vlan_get_flags(link),
-                                 flags_buf, sizeof(flags_buf));
+        NL_CALL_RET(_vlan_flags, (uint32_t)rtnl_link_vlan_get_flags(link),
+                    "rtnl_link_vlan_get_flags", "link=%p", (void *)link);
+        NL_CALL_VOID(rtnl_link_vlan_flags2str((int)_vlan_flags, flags_buf, sizeof(flags_buf)),
+                     "rtnl_link_vlan_flags2str",
+                     "flags=%u, buf=%p, len=%zu",
+                     _vlan_flags, (void *)flags_buf, sizeof(flags_buf));
+
+        NL_CALL_RET(_name, rtnl_link_get_name(link),
+                    "rtnl_link_get_name", "link=%p", (void *)link);
 
         printf("%-20s  %-20s  %-10d  %s\n",
-               rtnl_link_get_name(link),
+               _name,
                parent_name,
                vlan_id,
                flags_buf[0] ? flags_buf : "none");
 
         if (parent_link)
         {
-            rtnl_link_put(parent_link);
+            NL_CALL_VOID(rtnl_link_put(parent_link),
+                         "rtnl_link_put", "link=%p", (void *)parent_link);
             parent_link = NULL;
         }
+
+        NL_CALL_RET(_nl_iter, nl_cache_get_next((struct nl_object *)link),
+                    "nl_cache_get_next", "obj=%p", (void *)link);
+        link = (struct rtnl_link *)_nl_iter;
     }
 
-    nl_cache_free(cache);
-    nl_socket_free(sock);
+    NL_CALL_VOID(nl_cache_free(cache),
+                 "nl_cache_free", "cache=%p", (void *)cache);
+    NL_CALL_VOID(nl_socket_free(sock),
+                 "nl_socket_free", "sock=%p", (void *)sock);
     return 0;
 }
 
@@ -714,6 +923,8 @@ int cmd_set_vlan_on_interface(char* iface, char* type, char* ver)
     struct rtnl_link *vlan_link = NULL;
     char vlan_ifname[IFNAMSIZ];
     int err;
+    int _nl_err;
+    int _parent_idx;
 
     if (!iface || !type || !ver)
     {
@@ -721,73 +932,116 @@ int cmd_set_vlan_on_interface(char* iface, char* type, char* ver)
         return -1;
     }
 
-    sock = nl_socket_alloc();
+    NL_CALL_RET(sock, nl_socket_alloc(),
+                "nl_socket_alloc", "");
     if (!sock)
     {
         fprintf(stderr, "cmd_set_vlan_on_interface: failed to allocate netlink socket\n");
         return -2;
     }
 
-    if (nl_connect(sock, NETLINK_ROUTE) < 0)
+    NL_CALL_RET(_nl_err, nl_connect(sock, NETLINK_ROUTE),
+                "nl_connect", "sock=%p, protocol=NETLINK_ROUTE", (void *)sock);
+    if (_nl_err < 0)
     {
         fprintf(stderr, "cmd_set_vlan_on_interface: failed to connect netlink socket\n");
-        nl_socket_free(sock);
+        NL_CALL_VOID(nl_socket_free(sock),
+                     "nl_socket_free", "sock=%p", (void *)sock);
         return -3;
     }
 
-    if (rtnl_link_alloc_cache(sock, AF_UNSPEC, &cache) < 0)
+    NL_CALL_RET(_nl_err, rtnl_link_alloc_cache(sock, AF_UNSPEC, &cache),
+                "rtnl_link_alloc_cache",
+                "sock=%p, family=AF_UNSPEC, cache=%p",
+                (void *)sock, (void *)cache);
+    if (_nl_err < 0)
     {
         fprintf(stderr, "cmd_set_vlan_on_interface: failed to allocate link cache\n");
-        nl_socket_free(sock);
+        NL_CALL_VOID(nl_socket_free(sock),
+                     "nl_socket_free", "sock=%p", (void *)sock);
         return -4;
     }
 
-    parent = rtnl_link_get_by_name(cache, iface);
+    NL_CALL_RET(parent, rtnl_link_get_by_name(cache, iface),
+                "rtnl_link_get_by_name", "cache=%p, name=\"%s\"",
+                (void *)cache, iface);
     if (!parent)
     {
         fprintf(stderr, "cmd_set_vlan_on_interface: interface '%s' not found\n", iface);
-        nl_cache_free(cache);
-        nl_socket_free(sock);
+        NL_CALL_VOID(nl_cache_free(cache),
+                     "nl_cache_free", "cache=%p", (void *)cache);
+        NL_CALL_VOID(nl_socket_free(sock),
+                     "nl_socket_free", "sock=%p", (void *)sock);
         return -5;
     }
 
     snprintf(vlan_ifname, sizeof(vlan_ifname), "%s.%s", iface, ver);
 
     /* rtnl_link_vlan_alloc() allocates a link pre-configured as type "vlan" */
-    vlan_link = rtnl_link_vlan_alloc();
+    NL_CALL_RET(vlan_link, rtnl_link_vlan_alloc(),
+                "rtnl_link_vlan_alloc", "");
     if (!vlan_link)
     {
         fprintf(stderr, "cmd_set_vlan_on_interface: failed to allocate VLAN link object\n");
-        rtnl_link_put(parent);
-        nl_cache_free(cache);
-        nl_socket_free(sock);
+        NL_CALL_VOID(rtnl_link_put(parent),
+                     "rtnl_link_put", "link=%p", (void *)parent);
+        NL_CALL_VOID(nl_cache_free(cache),
+                     "nl_cache_free", "cache=%p", (void *)cache);
+        NL_CALL_VOID(nl_socket_free(sock),
+                     "nl_socket_free", "sock=%p", (void *)sock);
         return -6;
     }
 
-    rtnl_link_set_name(vlan_link, vlan_ifname);
-    rtnl_link_set_link(vlan_link, rtnl_link_get_ifindex(parent));
-    rtnl_link_set_ifalias(vlan_link, type);
-    /* Use placeholder VLAN ID 1; the real ID is set later by cmd_set_vlan() */
-    rtnl_link_vlan_set_id(vlan_link, 1);
+    NL_CALL_VOID(rtnl_link_set_name(vlan_link, vlan_ifname),
+                 "rtnl_link_set_name", "link=%p, name=\"%s\"",
+                 (void *)vlan_link, vlan_ifname);
 
-    err = rtnl_link_add(sock, vlan_link, NLM_F_CREATE);
+    NL_CALL_RET(_parent_idx, rtnl_link_get_ifindex(parent),
+                "rtnl_link_get_ifindex", "link=%p", (void *)parent);
+    NL_CALL_VOID(rtnl_link_set_link(vlan_link, _parent_idx),
+                 "rtnl_link_set_link", "link=%p, idx=%d",
+                 (void *)vlan_link, _parent_idx);
+
+    NL_CALL_VOID(rtnl_link_set_ifalias(vlan_link, type),
+                 "rtnl_link_set_ifalias", "link=%p, alias=\"%s\"",
+                 (void *)vlan_link, type);
+
+    /* Use placeholder VLAN ID 1; the real ID is set later by cmd_set_vlan() */
+    NL_CALL_VOID(rtnl_link_vlan_set_id(vlan_link, 1),
+                 "rtnl_link_vlan_set_id", "link=%p, id=1", (void *)vlan_link);
+
+    NL_CALL_RET(err, rtnl_link_add(sock, vlan_link, NLM_F_CREATE),
+                "rtnl_link_add",
+                "sock=%p, link=%p, flags=NLM_F_CREATE",
+                (void *)sock, (void *)vlan_link);
     if (err < 0)
     {
+        const char *_errmsg;
+        NL_CALL_RET(_errmsg, nl_geterror(err),
+                    "nl_geterror", "err=%d", err);
         fprintf(stderr, "cmd_set_vlan_on_interface: failed to create VLAN interface %s: %s\n",
-                vlan_ifname, nl_geterror(err));
-        rtnl_link_put(vlan_link);
-        rtnl_link_put(parent);
-        nl_cache_free(cache);
-        nl_socket_free(sock);
+                vlan_ifname, _errmsg);
+        NL_CALL_VOID(rtnl_link_put(vlan_link),
+                     "rtnl_link_put", "link=%p", (void *)vlan_link);
+        NL_CALL_VOID(rtnl_link_put(parent),
+                     "rtnl_link_put", "link=%p", (void *)parent);
+        NL_CALL_VOID(nl_cache_free(cache),
+                     "nl_cache_free", "cache=%p", (void *)cache);
+        NL_CALL_VOID(nl_socket_free(sock),
+                     "nl_socket_free", "sock=%p", (void *)sock);
         return -7;
     }
 
     printf("Created VLAN interface %s (type=%s) on %s\n", vlan_ifname, type, iface);
 
-    rtnl_link_put(vlan_link);
-    rtnl_link_put(parent);
-    nl_cache_free(cache);
-    nl_socket_free(sock);
+    NL_CALL_VOID(rtnl_link_put(vlan_link),
+                 "rtnl_link_put", "link=%p", (void *)vlan_link);
+    NL_CALL_VOID(rtnl_link_put(parent),
+                 "rtnl_link_put", "link=%p", (void *)parent);
+    NL_CALL_VOID(nl_cache_free(cache),
+                 "nl_cache_free", "cache=%p", (void *)cache);
+    NL_CALL_VOID(nl_socket_free(sock),
+                 "nl_socket_free", "sock=%p", (void *)sock);
     return 0;
 }
 
@@ -827,9 +1081,11 @@ int cmd_set_vlan(char* ver, char* id)
     struct nl_cache *cache = NULL;
     struct rtnl_link *link = NULL;
     struct rtnl_link *change = NULL;
+    struct nl_object *_nl_iter = NULL;
     int vlan_id;
     int found = 0;
     int ret_code = 0;
+    int _nl_err;
 
     if (!ver || !id)
     {
@@ -844,30 +1100,40 @@ int cmd_set_vlan(char* ver, char* id)
         return -1;
     }
 
-    sock = nl_socket_alloc();
+    NL_CALL_RET(sock, nl_socket_alloc(),
+                "nl_socket_alloc", "");
     if (!sock)
     {
         fprintf(stderr, "cmd_set_vlan: failed to allocate netlink socket\n");
         return -2;
     }
 
-    if (nl_connect(sock, NETLINK_ROUTE) < 0)
+    NL_CALL_RET(_nl_err, nl_connect(sock, NETLINK_ROUTE),
+                "nl_connect", "sock=%p, protocol=NETLINK_ROUTE", (void *)sock);
+    if (_nl_err < 0)
     {
         fprintf(stderr, "cmd_set_vlan: failed to connect netlink socket\n");
-        nl_socket_free(sock);
+        NL_CALL_VOID(nl_socket_free(sock),
+                     "nl_socket_free", "sock=%p", (void *)sock);
         return -3;
     }
 
-    if (rtnl_link_alloc_cache(sock, AF_UNSPEC, &cache) < 0)
+    NL_CALL_RET(_nl_err, rtnl_link_alloc_cache(sock, AF_UNSPEC, &cache),
+                "rtnl_link_alloc_cache",
+                "sock=%p, family=AF_UNSPEC, cache=%p",
+                (void *)sock, (void *)cache);
+    if (_nl_err < 0)
     {
         fprintf(stderr, "cmd_set_vlan: failed to allocate link cache\n");
-        nl_socket_free(sock);
+        NL_CALL_VOID(nl_socket_free(sock),
+                     "nl_socket_free", "sock=%p", (void *)sock);
         return -4;
     }
 
-    for (link = (struct rtnl_link *)nl_cache_get_first(cache);
-         link != NULL;
-         link = (struct rtnl_link *)nl_cache_get_next((struct nl_object *)link))
+    NL_CALL_RET(_nl_iter, nl_cache_get_first(cache),
+                "nl_cache_get_first", "cache=%p", (void *)cache);
+    link = (struct rtnl_link *)_nl_iter;
+    while (link != NULL)
     {
         const char *alias;
         const char *name;
@@ -875,12 +1141,22 @@ int cmd_set_vlan(char* ver, char* id)
         int alias_match = 0;
         int suffix_match = 0;
         int err;
+        int _is_vlan;
 
-        if (!rtnl_link_is_vlan(link))
+        NL_CALL_RET(_is_vlan, rtnl_link_is_vlan(link),
+                    "rtnl_link_is_vlan", "link=%p", (void *)link);
+        if (!_is_vlan)
+        {
+            NL_CALL_RET(_nl_iter, nl_cache_get_next((struct nl_object *)link),
+                        "nl_cache_get_next", "obj=%p", (void *)link);
+            link = (struct rtnl_link *)_nl_iter;
             continue;
+        }
 
-        alias = rtnl_link_get_ifalias(link);
-        name  = rtnl_link_get_name(link);
+        NL_CALL_RET(alias, rtnl_link_get_ifalias(link),
+                    "rtnl_link_get_ifalias", "link=%p", (void *)link);
+        NL_CALL_RET(name, rtnl_link_get_name(link),
+                    "rtnl_link_get_name", "link=%p", (void *)link);
 
         if (alias && strcmp(alias, ver) == 0)
             alias_match = 1;
@@ -893,10 +1169,16 @@ int cmd_set_vlan(char* ver, char* id)
         }
 
         if (!alias_match && !suffix_match)
+        {
+            NL_CALL_RET(_nl_iter, nl_cache_get_next((struct nl_object *)link),
+                        "nl_cache_get_next", "obj=%p", (void *)link);
+            link = (struct rtnl_link *)_nl_iter;
             continue;
+        }
 
         /* Build a minimal change object containing only the new VLAN ID */
-        change = rtnl_link_vlan_alloc();
+        NL_CALL_RET(change, rtnl_link_vlan_alloc(),
+                    "rtnl_link_vlan_alloc", "");
         if (!change)
         {
             fprintf(stderr, "cmd_set_vlan: failed to allocate change link for %s\n",
@@ -905,21 +1187,38 @@ int cmd_set_vlan(char* ver, char* id)
             break;
         }
 
-        rtnl_link_vlan_set_id(change, vlan_id);
+        NL_CALL_VOID(rtnl_link_vlan_set_id(change, vlan_id),
+                     "rtnl_link_vlan_set_id", "link=%p, id=%d",
+                     (void *)change, vlan_id);
 
-        err = rtnl_link_change(sock, link, change, 0);
+        NL_CALL_RET(err, rtnl_link_change(sock, link, change, 0),
+                    "rtnl_link_change",
+                    "sock=%p, link=%p, change=%p, flags=0",
+                    (void *)sock, (void *)link, (void *)change);
         if (err < 0)
         {
+            const char *_errmsg;
+            NL_CALL_RET(_errmsg, nl_geterror(err),
+                        "nl_geterror", "err=%d", err);
             fprintf(stderr, "cmd_set_vlan: failed to set VLAN ID %d on %s: %s\n",
-                    vlan_id, name ? name : "?", nl_geterror(err));
-            rtnl_link_put(change);
+                    vlan_id, name ? name : "?", _errmsg);
+            NL_CALL_VOID(rtnl_link_put(change),
+                         "rtnl_link_put", "link=%p", (void *)change);
             ret_code = -6;
+            NL_CALL_RET(_nl_iter, nl_cache_get_next((struct nl_object *)link),
+                        "nl_cache_get_next", "obj=%p", (void *)link);
+            link = (struct rtnl_link *)_nl_iter;
             continue;
         }
 
         printf("Set VLAN ID %d on %s (ver=%s)\n", vlan_id, name ? name : "?", ver);
-        rtnl_link_put(change);
+        NL_CALL_VOID(rtnl_link_put(change),
+                     "rtnl_link_put", "link=%p", (void *)change);
         found = 1;
+
+        NL_CALL_RET(_nl_iter, nl_cache_get_next((struct nl_object *)link),
+                    "nl_cache_get_next", "obj=%p", (void *)link);
+        link = (struct rtnl_link *)_nl_iter;
     }
 
     if (!found && ret_code == 0)
@@ -928,8 +1227,10 @@ int cmd_set_vlan(char* ver, char* id)
         ret_code = -5;
     }
 
-    nl_cache_free(cache);
-    nl_socket_free(sock);
+    NL_CALL_VOID(nl_cache_free(cache),
+                 "nl_cache_free", "cache=%p", (void *)cache);
+    NL_CALL_VOID(nl_socket_free(sock),
+                 "nl_socket_free", "sock=%p", (void *)sock);
     return ret_code;
 }
 
