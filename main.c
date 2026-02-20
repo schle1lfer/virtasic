@@ -1242,6 +1242,9 @@ int main()
     socklen_t addrlen = sizeof(address);
     char buffer[BUFFER_SIZE];
 
+    /* Disable stdout buffering so [NETLINK] log lines are written immediately */
+    setbuf(stdout, NULL);
+
     /* Bug fix: socket() returns -1 on failure, not 0; fd 0 is a valid descriptor */
     if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0)
     {
