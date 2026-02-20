@@ -23,7 +23,7 @@ $(TARGET_DAEMON): $(OBJ)
 	$(CC) $(INCLUDES) $(CFLAGS) -c $< -o $@
 
 %.o: %.cpp
-	$(CXX) $(INCLUDES) $(CXXLAGS) -c $< -o $@
+	$(CXX) $(INCLUDES) $(CXXFLAGS) -c $< -o $@
 
 clean:
 	rm -f $(OBJ) $(TARGET_DAEMON)

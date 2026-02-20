@@ -4,13 +4,14 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
-#include <linux/netlink.h>
+#include <sys/ioctl.h>
+#include <linux/netlink.h>      /* keep only one copy */
 #include <linux/if.h>
 #include <linux/if_ether.h>
 #include <linux/if_vlan.h>
-//#include <net/if.h>
+#include <linux/if_link.h>      /* IFLA_LINKINFO, IFLA_INFO_KIND, IFLA_INFO_DATA */
 #include <netinet/in.h>
-#include <linux/netlink.h>
+#include <netlink/attr.h>       /* nla_nest_start / nla_nest_end */
 #include <netlink/socket.h>
 #include <netlink/netlink.h>
 #include <netlink/route/link.h>
@@ -21,16 +22,27 @@
 #define PORT 8888
 #define BUFFER_SIZE 1024
 
-int get_words(const char* str, char** words, int* cnt);
+/* Forward declarations */
+int get_words(const char* str, char*** words, int* cnt);
 int cmd_show_interfaces();
 int cmd_rename_interfaces(char* prefix, char* new_prefix);
 int cmd_show_vlan();
 int cmd_set_vlan_on_interface(char* iface, char* type, char* ver);
 int cmd_set_vlan(char* ver, char* id);
 
-int get_words(const char* str, char** words, int* cnt)
+/*
+ * Tokenise `str` (space-separated words) into a freshly-allocated array of
+ * C-strings.  The array pointer is written to *words; the caller must free
+ * each element and then free the array itself.
+ *
+ * Bug fixes applied:
+ *   - parameter changed to char*** so the caller's pointer is updated
+ *   - sentinel check uses '\0' (null terminator), not '0' (digit zero)
+ *   - word null-termination uses '\0', not '0'
+ *   - old *words is freed before re-allocating
+ */
+int get_words(const char* str, char*** words, int* cnt)
 {
-    int ret_code = -1;
     int length = 0;
     int in_word = 0;
     int word_index = 0;
@@ -41,7 +53,7 @@ int get_words(const char* str, char** words, int* cnt)
         return -1;
     }
 
-    if(!cnt)
+    if (!cnt)
     {
         printf("cnt is NULL\n");
         return -2;
@@ -49,17 +61,18 @@ int get_words(const char* str, char** words, int* cnt)
 
     *cnt = 0;
 
-    if(words)
+    /* Free any previous array the caller may have passed in */
+    if (*words)
     {
         printf("words is not NULL\n");
-        free(words);
-        words = NULL;
+        free(*words);
+        *words = NULL;
     }
 
     length = strlen(str);
-    words = malloc(length * sizeof(char*));
+    *words = malloc(length * sizeof(char*));
 
-    if (words == NULL)
+    if (*words == NULL)
     {
         perror("Failed to allocate memory for words");
         return -3;
@@ -70,7 +83,8 @@ int get_words(const char* str, char** words, int* cnt)
     if (word == NULL)
     {
         perror("Failed to allocate memory for word");
-        free(words);
+        free(*words);
+        *words = NULL;
         return -4;
     }
 
@@ -78,7 +92,8 @@ int get_words(const char* str, char** words, int* cnt)
     in_word = 0;
     for (int i = 0; i <= length; i++)
     {
-        if (str[i] != ' ' && str[i] != '0')
+        /* Bug fix: was 'str[i] != '0'' — must check for '\0', not digit '0' */
+        if (str[i] != ' ' && str[i] != '\0')
         {
             word[word_index++] = str[i];
             in_word = 1;
@@ -87,19 +102,22 @@ int get_words(const char* str, char** words, int* cnt)
         {
             if (in_word)
             {
-                word[word_index] = '0';
-                words[*cnt] = malloc((word_index + 1) * sizeof(char));
-                if (words[*cnt] == NULL) {
+                /* Bug fix: was 'word[word_index] = '0'' — must be '\0' */
+                word[word_index] = '\0';
+                (*words)[*cnt] = malloc((word_index + 1) * sizeof(char));
+                if ((*words)[*cnt] == NULL)
+                {
                     perror("Failed to allocate memory for a word");
                     for (int j = 0; j < *cnt; j++)
                     {
-                        free(words[j]);
+                        free((*words)[j]);
                     }
-                    free(words);
+                    free(*words);
+                    *words = NULL;
                     free(word);
                     return -5;
                 }
-                strcpy(words[*cnt], word);
+                strcpy((*words)[*cnt], word);
                 (*cnt)++;
                 word_index = 0;
             }
@@ -112,26 +130,77 @@ int get_words(const char* str, char** words, int* cnt)
     return 0;
 }
 
-void create_vlan(const char *iface_name, int vlan_id)
+/*
+ * Helper: return the interface index for the named interface, or -1 on error.
+ * Uses ioctl(SIOCGIFINDEX) to avoid the net/if.h <-> linux/if.h conflict.
+ */
+static int get_iface_index(const char *iface_name)
+{
+    struct ifreq ifr;
+    int fd;
+
+    fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0)
+    {
+        perror("socket (get_iface_index)");
+        return -1;
+    }
+
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, iface_name, IFNAMSIZ - 1);
+
+    if (ioctl(fd, SIOCGIFINDEX, &ifr) < 0)
+    {
+        perror("ioctl SIOCGIFINDEX");
+        close(fd);
+        return -1;
+    }
+
+    close(fd);
+    return ifr.ifr_ifindex;
+}
+
+/*
+ * Create a VLAN sub-interface <iface_name>.<vlan_id> via Netlink RTM_NEWLINK.
+ *
+ * Bug fixes applied:
+ *   - ifi_family: AF_PACKET -> AF_UNSPEC
+ *   - Added IFLA_LINK (parent interface index) which is mandatory
+ *   - IFLA_VLAN_ID is now correctly nested inside IFLA_LINKINFO / IFLA_INFO_DATA
+ *   - VLAN ID attribute uses u16 (not u32)
+ *   - NLM_F_REQUEST flag added
+ *   - nlh NULL-check added
+ *   - All error paths return -1 instead of calling exit()
+ */
+int create_vlan(const char *iface_name, int vlan_id)
 {
     struct nl_sock *sock;
     struct nl_msg *msg;
     struct nlmsghdr *nlh;
     struct ifinfomsg *ifi;
+    struct nlattr *linkinfo, *data;
     char vlan_ifname[IFNAMSIZ];
+    int parent_idx;
+
+    parent_idx = get_iface_index(iface_name);
+    if (parent_idx < 0)
+    {
+        fprintf(stderr, "Failed to get index for interface %s\n", iface_name);
+        return -1;
+    }
 
     sock = nl_socket_alloc();
     if (!sock)
     {
         perror("nl_socket_alloc");
-        exit(EXIT_FAILURE);
+        return -1;
     }
 
     if (nl_connect(sock, NETLINK_ROUTE) < 0)
     {
         perror("nl_connect");
         nl_socket_free(sock);
-        exit(EXIT_FAILURE);
+        return -1;
     }
 
     snprintf(vlan_ifname, sizeof(vlan_ifname), "%s.%d", iface_name, vlan_id);
@@ -141,36 +210,104 @@ void create_vlan(const char *iface_name, int vlan_id)
     {
         perror("nlmsg_alloc");
         nl_socket_free(sock);
-        exit(EXIT_FAILURE);
+        return -1;
     }
 
-    nlh = nlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, RTM_NEWLINK, sizeof(struct ifinfomsg), NLM_F_CREATE | NLM_F_EXCL);
-    
-    ifi = (struct ifinfomsg *)NLMSG_DATA(nlh);
-    ifi->ifi_family = AF_PACKET;
-    ifi->ifi_change = IFF_UP;
-
-    if (nla_put_string(msg, IFLA_IFNAME, vlan_ifname) ||
-        nla_put_u32(msg, IFLA_VLAN_ID, vlan_id))
+    nlh = nlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, RTM_NEWLINK,
+                    sizeof(struct ifinfomsg),
+                    NLM_F_REQUEST | NLM_F_CREATE | NLM_F_EXCL);
+    if (!nlh)
     {
-        perror("nla_put");
+        fprintf(stderr, "nlmsg_put failed\n");
         nlmsg_free(msg);
         nl_socket_free(sock);
-        exit(EXIT_FAILURE);
+        return -1;
     }
+
+    ifi = nlmsg_data(nlh);
+    /* Bug fix: was AF_PACKET — the correct family for link creation is AF_UNSPEC */
+    ifi->ifi_family = AF_UNSPEC;
+    ifi->ifi_type   = 0;
+    ifi->ifi_index  = 0;
+    ifi->ifi_flags  = 0;
+    ifi->ifi_change = 0;
+
+    /* New VLAN interface name */
+    if (nla_put_string(msg, IFLA_IFNAME, vlan_ifname) < 0)
+    {
+        perror("nla_put IFLA_IFNAME");
+        nlmsg_free(msg);
+        nl_socket_free(sock);
+        return -1;
+    }
+
+    /* Bug fix: parent interface index is mandatory for VLAN sub-interfaces */
+    if (nla_put_u32(msg, IFLA_LINK, (uint32_t)parent_idx) < 0)
+    {
+        perror("nla_put IFLA_LINK");
+        nlmsg_free(msg);
+        nl_socket_free(sock);
+        return -1;
+    }
+
+    /*
+     * Bug fix: IFLA_VLAN_ID must be nested:
+     *   IFLA_LINKINFO
+     *     IFLA_INFO_KIND = "vlan"
+     *     IFLA_INFO_DATA
+     *       IFLA_VLAN_ID  (u16, not u32)
+     */
+    linkinfo = nla_nest_start(msg, IFLA_LINKINFO);
+    if (!linkinfo)
+    {
+        fprintf(stderr, "nla_nest_start(IFLA_LINKINFO) failed\n");
+        nlmsg_free(msg);
+        nl_socket_free(sock);
+        return -1;
+    }
+
+    if (nla_put_string(msg, IFLA_INFO_KIND, "vlan") < 0)
+    {
+        perror("nla_put IFLA_INFO_KIND");
+        nlmsg_free(msg);
+        nl_socket_free(sock);
+        return -1;
+    }
+
+    data = nla_nest_start(msg, IFLA_INFO_DATA);
+    if (!data)
+    {
+        fprintf(stderr, "nla_nest_start(IFLA_INFO_DATA) failed\n");
+        nlmsg_free(msg);
+        nl_socket_free(sock);
+        return -1;
+    }
+
+    /* Bug fix: VLAN ID is u16 per kernel ABI; was nla_put_u32 */
+    if (nla_put_u16(msg, IFLA_VLAN_ID, (uint16_t)vlan_id) < 0)
+    {
+        perror("nla_put IFLA_VLAN_ID");
+        nlmsg_free(msg);
+        nl_socket_free(sock);
+        return -1;
+    }
+
+    nla_nest_end(msg, data);
+    nla_nest_end(msg, linkinfo);
 
     if (nl_send_auto(sock, msg) < 0)
     {
         perror("nl_send_auto");
         nlmsg_free(msg);
         nl_socket_free(sock);
-        exit(EXIT_FAILURE);
+        return -1;
     }
 
     nlmsg_free(msg);
     nl_socket_free(sock);
 
     printf("VLAN %d created on interface %s\n", vlan_id, vlan_ifname);
+    return 0;
 }
 
 int set_reuseraddr(int sockfd)
@@ -196,62 +333,77 @@ void process_command(const char *cmd)
     char** cmd_words = NULL;
     int cmd_words_cnt = 0;
 
-    if (get_words(cmd, cmd_words, &cmd_words_cnt) < 0)
+    /* Bug fix: pass &cmd_words so get_words can store the allocated array */
+    if (get_words(cmd, &cmd_words, &cmd_words_cnt) < 0)
     {
         printf("Bad format command string: %s\n", cmd);
         return;
     }
 
-    // show interfaces
+    /* show interfaces */
     if (strcmp(cmd, "show interfaces") == 0)
     {
         printf("Executing: %s\n", cmd);
-        cmd_show_interfaces();  
+        cmd_show_interfaces();
     }
-    // rename interfaces
-    else if (strcmp(cmd, "rename interfaces") == 0)
+    /* rename interfaces <prefix> <new_prefix> */
+    else if (strncmp(cmd, "rename interfaces", 17) == 0)
     {
         printf("Executing: %s\n", cmd);
         if (cmd_words_cnt != 4)
         {
             printf("Bad format command: %s\n", cmd);
-            return;
         }
+        else
+        {
         cmd_rename_interfaces(cmd_words[2], cmd_words[3]);
     }
-    // show vlan
+    }
+    /* show vlan */
     else if (strcmp(cmd, "show vlan") == 0)
     {
         printf("Executing: %s\n", cmd);
         cmd_show_vlan();
     }
-    // set interface Ethernet56 type l2-trunk vlan v2
-    else if (strncmp(cmd, "set interface ", 15) == 0)
+    /* set interface Ethernet56 type l2-trunk vlan v2 */
+    /* Bug fix: "set interface " is 14 characters, not 15 */
+    else if (strncmp(cmd, "set interface ", 14) == 0)
     {
         printf("Executing: %s\n", cmd);
         if (cmd_words_cnt != 7)
         {
             printf("Bad format command: %s\n", cmd);
-            return;
         }
+        else
+        {
         cmd_set_vlan_on_interface(cmd_words[2], cmd_words[4], cmd_words[6]);
     }
-    // set vlan v2 id 2
+    }
+    /* set vlan v2 id 2 */
     else if (strncmp(cmd, "set vlan ", 9) == 0)
     {
         printf("Executing: %s\n", cmd);
         if (cmd_words_cnt != 5)
         {
             printf("Bad format command: %s\n", cmd);
-            return;
         }
-        cmd_set_vlan(cmd_words[2], cmd_words[4]);  
+        else
+        {
+            cmd_set_vlan(cmd_words[2], cmd_words[4]);
+        }
     }
-    // default
+    /* default */
     else
     {
         printf("Unknown command: %s\n", cmd);
     }
+
+    /* Bug fix: free the words array allocated by get_words */
+    for (int i = 0; i < cmd_words_cnt; i++)
+    {
+        free(cmd_words[i]);
+    }
+    free(cmd_words);
 }
 
 /*
@@ -785,12 +937,22 @@ int main()
 {
     int server_fd, new_socket;
     struct sockaddr_in address;
-    int addrlen = sizeof(address);
+    /* Bug fix: addrlen must be socklen_t, not int */
+    socklen_t addrlen = sizeof(address);
     char buffer[BUFFER_SIZE];
 
-    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0)
+    /* Bug fix: socket() returns -1 on failure, not 0; fd 0 is a valid descriptor */
+    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0)
     {
         perror("socket failed");
+        exit(EXIT_FAILURE);
+    }
+
+    /* Bug fix: SO_REUSEADDR must be set BEFORE bind(), not after listen() */
+    if (set_reuseraddr(server_fd) < 0)
+    {
+        perror("set_reuseraddr");
+        close(server_fd);
         exit(EXIT_FAILURE);
     }
 
@@ -801,22 +963,20 @@ int main()
     if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0)
     {
         perror("bind failed");
+        close(server_fd);
         exit(EXIT_FAILURE);
     }
 
     if (listen(server_fd, 3) < 0)
     {
         perror("listen");
-        exit(EXIT_FAILURE);
-    }
-
-    if (set_reuseraddr(server_fd) < 0)
-    {
+        close(server_fd);
         exit(EXIT_FAILURE);
     }
 
     if (set_nonblocking(server_fd) < 0)
     {
+        close(server_fd);
         exit(EXIT_FAILURE);
     }
 
@@ -824,14 +984,23 @@ int main()
 
     while (1)
     {
-        if ((new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) >= 0)
+        if ((new_socket = accept(server_fd, (struct sockaddr *)&address, &addrlen)) >= 0)
         {
             printf("New connection established\n");
 
             int bytes_read;
             while ((bytes_read = read(new_socket, buffer, BUFFER_SIZE - 1)) > 0)
             {
-                buffer[bytes_read] = '0';
+                /* Bug fix: was 'buffer[bytes_read] = '0'' — must be '\0' */
+                buffer[bytes_read] = '\0';
+
+                /* Strip trailing CR/LF so strcmp-based dispatch works correctly */
+                int len = bytes_read;
+                while (len > 0 && (buffer[len - 1] == '\n' || buffer[len - 1] == '\r'))
+                {
+                    buffer[--len] = '\0';
+                }
+
                 printf("Received command: %s\n", buffer);
                 process_command(buffer);
             }
@@ -841,7 +1010,7 @@ int main()
         }
         else
         {
-            usleep(100000); // 100 ms
+            usleep(100000); /* 100 ms */
         }
     }
 
