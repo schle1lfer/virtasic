@@ -1,8 +1,6 @@
 CC = gcc
 CXX = g++
 LD = gcc
-SRC = main.c
-OBJ = $(SRC:.c=.o)
 INCLUDES = -I/usr/include/libnl3
 CFLAGS = -Wall -Wextra
 CXXFLAGS = -Wall -Wextra
@@ -13,10 +11,17 @@ STATIC_LIBS =
 DYNAMIC_LIBS = -lpthread -ldl -lnl-3 -lnl-genl-3 -lnl-route-3
 
 TARGET_DAEMON = virtasic
+TARGET_TEST   = test_vlan
 
-all: $(TARGET_DAEMON)
+DAEMON_OBJS = main.o vlan_api.o
+TEST_OBJS   = test_vlan.o vlan_api.o
 
-$(TARGET_DAEMON): $(OBJ)
+all: $(TARGET_DAEMON) $(TARGET_TEST)
+
+$(TARGET_DAEMON): $(DAEMON_OBJS)
+	$(LD) -o $@ $^ $(LDFLAGS) $(STATIC_LIBS) $(DYNAMIC_LIBS)
+
+$(TARGET_TEST): test_vlan.o vlan_api.o
 	$(LD) -o $@ $^ $(LDFLAGS) $(STATIC_LIBS) $(DYNAMIC_LIBS)
 
 %.o: %.c
@@ -26,7 +31,7 @@ $(TARGET_DAEMON): $(OBJ)
 	$(CXX) $(INCLUDES) $(CXXFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(OBJ) $(TARGET_DAEMON)
+	rm -f $(DAEMON_OBJS) $(TEST_OBJS) $(TARGET_DAEMON) $(TARGET_TEST)
 
 distclean: clean
 

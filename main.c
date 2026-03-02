@@ -20,44 +20,10 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 
+#include "vlan_api.h"    /* NL_CALL_RET, NL_CALL_VOID, VLAN API */
+
 #define PORT 8888
 #define BUFFER_SIZE 1024
-
-/*
- * ---------------------------------------------------------------------------
- * Netlink API call logging helpers
- *
- * NL_CALL_RET(var, call, fn_name, params_fmt, ...)
- *   Executes `call`, assigns the result to `var`, then prints the function
- *   name, formatted parameter description, and elapsed wall-clock time (ms).
- *
- * NL_CALL_VOID(call, fn_name, params_fmt, ...)
- *   Same as NL_CALL_RET but for calls whose return value is not used.
- * ---------------------------------------------------------------------------
- */
-#define NL_CALL_RET(var, call, fn_name, params_fmt, ...)                    \
-    do {                                                                     \
-        struct timespec _nl_t0, _nl_t1;                                     \
-        clock_gettime(CLOCK_MONOTONIC, &_nl_t0);                            \
-        (var) = (call);                                                      \
-        clock_gettime(CLOCK_MONOTONIC, &_nl_t1);                            \
-        double _nl_ms = (_nl_t1.tv_sec  - _nl_t0.tv_sec)  * 1000.0         \
-                      + (_nl_t1.tv_nsec - _nl_t0.tv_nsec) / 1.0e6;         \
-        printf("[NETLINK] %s(" params_fmt ") => %.3f ms\n",                 \
-               fn_name, ##__VA_ARGS__, _nl_ms);                             \
-    } while (0)
-
-#define NL_CALL_VOID(call, fn_name, params_fmt, ...)                        \
-    do {                                                                     \
-        struct timespec _nl_t0, _nl_t1;                                     \
-        clock_gettime(CLOCK_MONOTONIC, &_nl_t0);                            \
-        (call);                                                              \
-        clock_gettime(CLOCK_MONOTONIC, &_nl_t1);                            \
-        double _nl_ms = (_nl_t1.tv_sec  - _nl_t0.tv_sec)  * 1000.0         \
-                      + (_nl_t1.tv_nsec - _nl_t0.tv_nsec) / 1.0e6;         \
-        printf("[NETLINK] %s(" params_fmt ") => %.3f ms\n",                 \
-               fn_name, ##__VA_ARGS__, _nl_ms);                             \
-    } while (0)
 
 /* Forward declarations */
 int get_words(const char* str, char*** words, int* cnt);
@@ -66,6 +32,7 @@ int cmd_rename_interfaces(char* prefix, char* new_prefix);
 int cmd_show_vlan();
 int cmd_set_vlan_on_interface(char* iface, char* type, char* ver);
 int cmd_set_vlan(char* ver, char* id);
+int nl_create_vlan_subif(const char *iface_name, int vlan_id);
 
 /*
  * Tokenise `str` (space-separated words) into a freshly-allocated array of
@@ -209,7 +176,7 @@ static int get_iface_index(const char *iface_name)
  *   - nlh NULL-check added
  *   - All error paths return -1 instead of calling exit()
  */
-int create_vlan(const char *iface_name, int vlan_id)
+int nl_create_vlan_subif(const char *iface_name, int vlan_id)
 {
     struct nl_sock *sock;
     struct nl_msg *msg;
@@ -483,6 +450,58 @@ void process_command(const char *cmd)
         else
         {
             cmd_set_vlan(cmd_words[2], cmd_words[4]);
+        }
+    }
+    /* create vlan <id> */
+    else if (strncmp(cmd, "create vlan ", 12) == 0)
+    {
+        printf("Executing: %s\n", cmd);
+        if (cmd_words_cnt != 3)
+        {
+            printf("Bad format command: %s\n", cmd);
+        }
+        else
+        {
+            create_vlan((uint16_t)atoi(cmd_words[2]));
+        }
+    }
+    /* delete vlan <id> */
+    else if (strncmp(cmd, "delete vlan ", 12) == 0)
+    {
+        printf("Executing: %s\n", cmd);
+        if (cmd_words_cnt != 3)
+        {
+            printf("Bad format command: %s\n", cmd);
+        }
+        else
+        {
+            delete_vlan((uint16_t)atoi(cmd_words[2]));
+        }
+    }
+    /* add vlan <id> to <iface> */
+    else if (strncmp(cmd, "add vlan ", 9) == 0)
+    {
+        printf("Executing: %s\n", cmd);
+        if (cmd_words_cnt != 5)
+        {
+            printf("Bad format command: %s\n", cmd);
+        }
+        else
+        {
+            add_vlan_assignment((uint16_t)atoi(cmd_words[2]), cmd_words[4]);
+        }
+    }
+    /* remove vlan <id> from <iface> */
+    else if (strncmp(cmd, "remove vlan ", 12) == 0)
+    {
+        printf("Executing: %s\n", cmd);
+        if (cmd_words_cnt != 5)
+        {
+            printf("Bad format command: %s\n", cmd);
+        }
+        else
+        {
+            remove_vlan_assignment((uint16_t)atoi(cmd_words[2]), cmd_words[4]);
         }
     }
     /* default */
