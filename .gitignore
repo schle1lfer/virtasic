@@ -37,6 +37,7 @@
 *.out
 *.app
 virtasic
+test_vlan
 
 # debug information files
 *.dwo
