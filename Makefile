@@ -10,18 +10,23 @@ LDFLAGS =
 STATIC_LIBS =
 DYNAMIC_LIBS = -lpthread -ldl -lnl-3 -lnl-genl-3 -lnl-route-3
 
-TARGET_DAEMON = virtasic
-TARGET_TEST   = test_vlan
+TARGET_DAEMON      = virtasic
+TARGET_TEST        = test_vlan
+TARGET_TEST_BRIDGE = test_bridge
 
-DAEMON_OBJS = main.o vlan_api.o
-TEST_OBJS   = test_vlan.o vlan_api.o
+DAEMON_OBJS      = main.o vlan_api.o
+TEST_OBJS        = test_vlan.o vlan_api.o
+TEST_BRIDGE_OBJS = test_bridge.o bridge_api.o
 
-all: $(TARGET_DAEMON) $(TARGET_TEST)
+all: $(TARGET_DAEMON) $(TARGET_TEST) $(TARGET_TEST_BRIDGE)
 
 $(TARGET_DAEMON): $(DAEMON_OBJS)
 	$(LD) -o $@ $^ $(LDFLAGS) $(STATIC_LIBS) $(DYNAMIC_LIBS)
 
 $(TARGET_TEST): test_vlan.o vlan_api.o
+	$(LD) -o $@ $^ $(LDFLAGS) $(STATIC_LIBS) $(DYNAMIC_LIBS)
+
+$(TARGET_TEST_BRIDGE): $(TEST_BRIDGE_OBJS)
 	$(LD) -o $@ $^ $(LDFLAGS) $(STATIC_LIBS) $(DYNAMIC_LIBS)
 
 %.o: %.c
@@ -31,7 +36,8 @@ $(TARGET_TEST): test_vlan.o vlan_api.o
 	$(CXX) $(INCLUDES) $(CXXFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(DAEMON_OBJS) $(TEST_OBJS) $(TARGET_DAEMON) $(TARGET_TEST)
+	rm -f $(DAEMON_OBJS) $(TEST_OBJS) $(TEST_BRIDGE_OBJS) \
+	      $(TARGET_DAEMON) $(TARGET_TEST) $(TARGET_TEST_BRIDGE)
 
 distclean: clean
 

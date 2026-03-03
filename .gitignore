@@ -38,6 +38,7 @@
 *.app
 virtasic
 test_vlan
+test_bridge
 
 # debug information files
 *.dwo
