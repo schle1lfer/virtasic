@@ -13,8 +13,8 @@ DYNAMIC_LIBS = -lpthread -ldl -lnl-3 -lnl-genl-3 -lnl-route-3
 TARGET_DAEMON = virtasic
 TARGET_TEST   = test_vlan
 
-DAEMON_OBJS = main.o vlan_api.o
-TEST_OBJS   = test_vlan.o vlan_api.o
+DAEMON_OBJS = main.o vlan_api.o bridge_netlink.o
+TEST_OBJS   = test_vlan.o vlan_api.o bridge_netlink.o
 
 all: $(TARGET_DAEMON) $(TARGET_TEST)
 
