@@ -38,6 +38,7 @@
 *.app
 virtasic
 test_vlan
+test_async
 
 # debug information files
 *.dwo
