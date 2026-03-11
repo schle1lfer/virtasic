@@ -1,19 +1,24 @@
 /**
  * @file async_test.c
- * @brief Unit tests for the queue-based async_func / async_worker subsystem.
+ * @brief Unit tests for the non-blocking async_func / async_worker subsystem.
+ *
+ * All tests use the polling model:
+ *   1. async_func()          — submit, get request ID
+ *   2. async_worker_status() — poll until ASYNC_STATUS_FREE
+ *   3. async_get_result()    — copy result, release slot
+ *
+ * async_worker_wait() does not exist; there is no blocking wait path.
  *
  * Tests
  * -----
- *  1. test_single       – Submit one request, wait by ID, verify result.
- *  2. test_queue_fifo   – Submit four requests without waiting; collect them
- *                         in reverse order to confirm per-ID tracking works.
- *  3. test_status       – Submit a slow function; poll async_worker_status()
- *                         while it runs (must be BUSY), then after
- *                         async_worker_wait() it must be FREE.
- *  4. test_queue_full   – Fill all ASYNC_QUEUE_DEPTH slots, verify the next
- *                         submission returns ASYNC_REQ_INVALID, then drain.
- *  5. test_sequential   – Submit five additions back-to-back (wait between
- *                         each) to confirm slot reuse works correctly.
+ *  1. test_single         – One request; poll then get result.
+ *  2. test_multi_poll     – Four requests in flight simultaneously; poll all,
+ *                           retrieve in reverse ID order.
+ *  3. test_get_not_ready  – async_get_result() on an in-progress request must
+ *                           return -1 (not ready).
+ *  4. test_queue_full     – Fill all ASYNC_QUEUE_DEPTH slots; verify the next
+ *                           submission returns ASYNC_REQ_INVALID; drain.
+ *  5. test_sequential     – Five back-to-back requests to confirm slot reuse.
  */
 
 #include "async_func.h"
@@ -23,7 +28,6 @@
 #include <string.h>
 #include <unistd.h>    /* usleep */
 #include <stdint.h>
-#include <stdatomic.h>
 
 /* -------------------------------------------------------------------------
  * Test helpers
@@ -42,6 +46,20 @@ static int tests_passed = 0;
             printf("  [FAIL] %s  (line %d)\n", (msg), __LINE__);            \
         }                                                                    \
     } while (0)
+
+/**
+ * @brief Poll until the given request ID is no longer BUSY.
+ *
+ * Yields 500 µs between polls so the test thread does not spin-burn the CPU.
+ *
+ * @param[in] worker  Initialised worker handle.
+ * @param[in] id      Request ID to wait on.
+ */
+static void poll_until_ready(async_worker_t *worker, async_req_id_t id)
+{
+    while (async_worker_status(worker, id) == ASYNC_STATUS_BUSY)
+        usleep(500);
+}
 
 /* -------------------------------------------------------------------------
  * Functions dispatched asynchronously
@@ -83,7 +101,8 @@ static void fn_strlen(struct iovec *params, int nparams, struct iovec *result)
 }
 
 /**
- * @brief Sleeps 80 ms then adds two ints — used to hold the executor busy.
+ * @brief Sleeps 80 ms then adds two ints.  Holds the executor busy long
+ *        enough to test BUSY status and premature async_get_result().
  *
  * @param[in]  params   params[0]: int A; params[1]: int B.
  * @param[in]  nparams  Must be 2.
@@ -96,7 +115,7 @@ static void fn_slow_add(struct iovec *params, int nparams, struct iovec *result)
 }
 
 /**
- * @brief Sleeps 1 ms then adds two ints — used to fill the queue quickly.
+ * @brief Sleeps 1 ms then adds two ints (used to saturate the queue quickly).
  *
  * @param[in]  params   params[0]: int A; params[1]: int B.
  * @param[in]  nparams  Must be 2.
@@ -109,13 +128,11 @@ static void fn_tiny_add(struct iovec *params, int nparams, struct iovec *result)
 }
 
 /* -------------------------------------------------------------------------
- * Test 1 – Single request, wait by ID
+ * Test 1 – Single request: poll then retrieve
  * ---------------------------------------------------------------------- */
 
 /**
- * @brief Test 1 – Basic single submission and per-ID wait.
- *
- * Submits fn_add(7, 3), waits by request ID, verifies result == 10.
+ * @brief Test 1 – Submit fn_add(7, 3), poll until FREE, retrieve result.
  *
  * @param[in] worker  Initialised worker handle.
  */
@@ -123,135 +140,157 @@ static void test_single(async_worker_t *worker)
 {
     printf("\n[Test 1] Single request: fn_add(7, 3) == 10\n");
 
-    int a = 7, b = 3, res = -1;
+    int a = 7, b = 3;
     struct iovec params[2] = {
         { .iov_base = &a, .iov_len = sizeof(a) },
         { .iov_base = &b, .iov_len = sizeof(b) },
     };
-    struct iovec result = { .iov_base = &res, .iov_len = sizeof(res) };
 
-    async_req_id_t id = async_func(worker, fn_add, params, 2, &result);
+    async_req_id_t id = async_func(worker, fn_add, params, 2);
     ASSERT(id != ASYNC_REQ_INVALID, "async_func() returned valid request ID");
     printf("  Request ID: %u\n", id);
 
-    async_worker_wait(worker, id);
+    /* Poll without blocking */
+    poll_until_ready(worker, id);
+    ASSERT(async_worker_status(worker, id) == ASYNC_STATUS_FREE,
+           "status is FREE after polling");
+
+    /* Retrieve result */
+    int res = -1;
+    struct iovec out = { .iov_base = &res, .iov_len = sizeof(res) };
+    int rc = async_get_result(worker, id, &out);
+
+    ASSERT(rc == 0,   "async_get_result() returned 0 (success)");
     ASSERT(res == 10, "result == 10");
     printf("  Result: %d\n", res);
+
+    /* Slot released: status must now be FREE (not found) */
+    ASSERT(async_worker_status(worker, id) == ASYNC_STATUS_FREE,
+           "status FREE after slot released");
+
+    /* Second call with the same ID must fail */
+    int res2 = -1;
+    struct iovec out2 = { .iov_base = &res2, .iov_len = sizeof(res2) };
+    ASSERT(async_get_result(worker, id, &out2) == -1,
+           "async_get_result() returns -1 for released ID");
 }
 
 /* -------------------------------------------------------------------------
- * Test 2 – FIFO queue: submit four, collect in reverse order
+ * Test 2 – Four requests in flight; collect in reverse order
  * ---------------------------------------------------------------------- */
 
 /**
- * @brief Test 2 – Four queued requests collected out of submission order.
- *
- * Submits fn_add(1,1), fn_strlen("hello"), fn_add(4,6), fn_add(10,20),
- * then waits for them in reverse order by request ID.  Verifies that
- * per-ID tracking correctly maps each result to its original request.
+ * @brief Test 2 – Four simultaneous requests, status-polled independently,
+ *                 result retrieved in reverse submission order.
  *
  * @param[in] worker  Initialised worker handle.
  */
-static void test_queue_fifo(async_worker_t *worker)
+static void test_multi_poll(async_worker_t *worker)
 {
-    printf("\n[Test 2] Four queued requests collected in reverse order\n");
+    printf("\n[Test 2] Four concurrent requests, retrieved in reverse order\n");
 
-#define NREQ 4
-    async_req_id_t ids[NREQ];
-
+#define NR 4
     /* Request 0: fn_add(1, 1) → 2 */
-    int a0 = 1, b0 = 1, res0 = -1;
+    int a0 = 1, b0 = 1;
     struct iovec p0[2] = { { &a0, sizeof(a0) }, { &b0, sizeof(b0) } };
-    struct iovec r0 = { &res0, sizeof(res0) };
 
     /* Request 1: fn_strlen("hello") → 5 */
     const char *s1 = "hello";
-    size_t res1 = 0;
     struct iovec p1[1] = { { (void *)s1, strlen(s1) + 1 } };
-    struct iovec r1 = { &res1, sizeof(res1) };
 
     /* Request 2: fn_add(4, 6) → 10 */
-    int a2 = 4, b2 = 6, res2 = -1;
+    int a2 = 4, b2 = 6;
     struct iovec p2[2] = { { &a2, sizeof(a2) }, { &b2, sizeof(b2) } };
-    struct iovec r2 = { &res2, sizeof(res2) };
 
     /* Request 3: fn_add(10, 20) → 30 */
-    int a3 = 10, b3 = 20, res3 = -1;
+    int a3 = 10, b3 = 20;
     struct iovec p3[2] = { { &a3, sizeof(a3) }, { &b3, sizeof(b3) } };
-    struct iovec r3 = { &res3, sizeof(res3) };
 
-    ids[0] = async_func(worker, fn_add,    p0, 2, &r0);
-    ids[1] = async_func(worker, fn_strlen, p1, 1, &r1);
-    ids[2] = async_func(worker, fn_add,    p2, 2, &r2);
-    ids[3] = async_func(worker, fn_add,    p3, 2, &r3);
+    async_req_id_t ids[NR];
+    ids[0] = async_func(worker, fn_add,    p0, 2);
+    ids[1] = async_func(worker, fn_strlen, p1, 1);
+    ids[2] = async_func(worker, fn_add,    p2, 2);
+    ids[3] = async_func(worker, fn_add,    p3, 2);
 
-    for (int i = 0; i < NREQ; i++)
+    for (int i = 0; i < NR; i++)
         ASSERT(ids[i] != ASYNC_REQ_INVALID, "submission accepted");
 
-    /* Collect in reverse order */
-    async_worker_wait(worker, ids[3]); ASSERT(res3 == 30, "req3: 10+20 == 30");
-    async_worker_wait(worker, ids[2]); ASSERT(res2 == 10, "req2:  4+6  == 10");
-    async_worker_wait(worker, ids[1]); ASSERT(res1 ==  5, "req1: strlen(hello) == 5");
-    async_worker_wait(worker, ids[0]); ASSERT(res0 ==  2, "req0:  1+1  == 2");
+    /* Poll all four to completion */
+    for (int i = 0; i < NR; i++)
+        poll_until_ready(worker, ids[i]);
+
+    /* Retrieve in reverse order */
+    int     res0 = -1; struct iovec out0 = { &res0, sizeof(res0) };
+    size_t  res1 =  0; struct iovec out1 = { &res1, sizeof(res1) };
+    int     res2 = -1; struct iovec out2 = { &res2, sizeof(res2) };
+    int     res3 = -1; struct iovec out3 = { &res3, sizeof(res3) };
+
+    ASSERT(async_get_result(worker, ids[3], &out3) == 0, "get ids[3]");
+    ASSERT(async_get_result(worker, ids[2], &out2) == 0, "get ids[2]");
+    ASSERT(async_get_result(worker, ids[1], &out1) == 0, "get ids[1]");
+    ASSERT(async_get_result(worker, ids[0], &out0) == 0, "get ids[0]");
+
+    ASSERT(res3 == 30, "req3: 10+20 == 30");
+    ASSERT(res2 == 10, "req2:  4+6  == 10");
+    ASSERT(res1 ==  5, "req1: strlen(\"hello\") == 5");
+    ASSERT(res0 ==  2, "req0:  1+1  == 2");
 
     printf("  Results: %d, %zu, %d, %d\n", res0, res1, res2, res3);
-#undef NREQ
+#undef NR
 }
 
 /* -------------------------------------------------------------------------
- * Test 3 – Status polling: BUSY while running, FREE after wait
+ * Test 3 – async_get_result() on an in-progress request returns -1
  * ---------------------------------------------------------------------- */
 
 /**
- * @brief Test 3 – async_worker_status() returns BUSY then FREE.
- *
- * Submits fn_slow_add (80 ms).  Polls status in a loop until BUSY is
- * observed, then waits and checks FREE.
+ * @brief Test 3 – Calling async_get_result() before the function finishes
+ *                 must return -1 (not ready).
  *
  * @param[in] worker  Initialised worker handle.
  */
-static void test_status(async_worker_t *worker)
+static void test_get_not_ready(async_worker_t *worker)
 {
-    printf("\n[Test 3] Status: BUSY while running, FREE after wait\n");
+    printf("\n[Test 3] async_get_result() returns -1 while request is BUSY\n");
 
-    int a = 5, b = 7, res = -1;
+    int a = 3, b = 4;
     struct iovec params[2] = { { &a, sizeof(a) }, { &b, sizeof(b) } };
-    struct iovec result = { &res, sizeof(res) };
 
-    async_req_id_t id = async_func(worker, fn_slow_add, params, 2, &result);
+    async_req_id_t id = async_func(worker, fn_slow_add, params, 2);
     ASSERT(id != ASYNC_REQ_INVALID, "submission accepted");
 
-    /* Poll until we catch the request as BUSY (may need a few iterations
-     * before the dispatcher picks it up).                                 */
+    /* Spin until we observe BUSY (dispatcher may take a few µs) */
     int saw_busy = 0;
-    for (int i = 0; i < 200; i++) {
-        if (async_worker_status(worker, id) == ASYNC_STATUS_BUSY) {
+    for (int i = 0; i < 500 && !saw_busy; i++) {
+        if (async_worker_status(worker, id) == ASYNC_STATUS_BUSY)
             saw_busy = 1;
-            break;
-        }
-        usleep(1000);
+        else
+            usleep(1000);
     }
-    ASSERT(saw_busy, "observed ASYNC_STATUS_BUSY while request is in progress");
+    ASSERT(saw_busy, "observed ASYNC_STATUS_BUSY while fn_slow_add runs");
 
-    async_worker_wait(worker, id);
+    /* Premature result retrieval must fail */
+    int res = -1;
+    struct iovec out = { .iov_base = &res, .iov_len = sizeof(res) };
+    int rc = async_get_result(worker, id, &out);
+    ASSERT(rc == -1, "async_get_result() == -1 while still BUSY");
+    ASSERT(res == -1, "result buffer untouched on -1 return");
 
-    async_status_t st_after = async_worker_status(worker, id);
-    ASSERT(st_after == ASYNC_STATUS_FREE,
-           "status is FREE (slot released) after async_worker_wait()");
-    ASSERT(res == 12, "result == 12 (5 + 7)");
+    /* Poll until done, then collect */
+    poll_until_ready(worker, id);
+    rc = async_get_result(worker, id, &out);
+    ASSERT(rc == 0,  "async_get_result() == 0 after becoming FREE");
+    ASSERT(res == 7, "result == 7 (3 + 4)");
     printf("  Result: %d\n", res);
 }
 
 /* -------------------------------------------------------------------------
- * Test 4 – Queue-full rejection and drain
+ * Test 4 – Queue-full: overflow returns ASYNC_REQ_INVALID
  * ---------------------------------------------------------------------- */
 
 /**
- * @brief Test 4 – Filling all queue slots triggers ASYNC_REQ_INVALID.
- *
- * Submits ASYNC_QUEUE_DEPTH slow requests to saturate the pool, then verifies
- * that one more submission is rejected.  Drains all requests afterwards to
- * leave the worker clean for subsequent tests.
+ * @brief Test 4 – Fill all ASYNC_QUEUE_DEPTH slots; the next submission must
+ *                 be rejected with ASYNC_REQ_INVALID.
  *
  * @param[in] worker  Initialised worker handle.
  */
@@ -260,48 +299,40 @@ static void test_queue_full(async_worker_t *worker)
     printf("\n[Test 4] Queue-full rejection (depth = %d)\n", ASYNC_QUEUE_DEPTH);
 
     async_req_id_t ids[ASYNC_QUEUE_DEPTH];
-    int results[ASYNC_QUEUE_DEPTH];
-    struct iovec result_vecs[ASYNC_QUEUE_DEPTH];
+    int accepted = 0;
 
     int a = 1, b = 1;
     struct iovec params[2] = { { &a, sizeof(a) }, { &b, sizeof(b) } };
 
-    int accepted = 0;
     for (int i = 0; i < ASYNC_QUEUE_DEPTH; i++) {
-        results[i] = -1;
-        result_vecs[i].iov_base = &results[i];
-        result_vecs[i].iov_len  = sizeof(results[i]);
-        ids[i] = async_func(worker, fn_tiny_add, params, 2, &result_vecs[i]);
+        ids[i] = async_func(worker, fn_tiny_add, params, 2);
         if (ids[i] != ASYNC_REQ_INVALID)
             accepted++;
     }
     printf("  Accepted %d / %d submissions\n", accepted, ASYNC_QUEUE_DEPTH);
 
-    /* One extra submission must now be rejected */
-    int extra_res = -1;
-    struct iovec extra_result = { &extra_res, sizeof(extra_res) };
-    async_req_id_t overflow_id = async_func(worker, fn_add, params, 2,
-                                            &extra_result);
-    ASSERT(overflow_id == ASYNC_REQ_INVALID,
+    async_req_id_t overflow = async_func(worker, fn_add, params, 2);
+    ASSERT(overflow == ASYNC_REQ_INVALID,
            "overflow submission rejected (ASYNC_REQ_INVALID)");
+    ASSERT(accepted > 0, "at least one slot was accepted");
 
-    /* Drain all accepted requests */
+    /* Drain: poll each accepted request then retrieve its result */
+    int dummy = -1;
+    struct iovec out = { &dummy, sizeof(dummy) };
     for (int i = 0; i < ASYNC_QUEUE_DEPTH; i++) {
-        if (ids[i] != ASYNC_REQ_INVALID)
-            async_worker_wait(worker, ids[i]);
+        if (ids[i] != ASYNC_REQ_INVALID) {
+            poll_until_ready(worker, ids[i]);
+            async_get_result(worker, ids[i], &out);
+        }
     }
-    ASSERT(accepted > 0, "at least one slot was accepted before queue full");
 }
 
 /* -------------------------------------------------------------------------
- * Test 5 – Sequential reuse of slots
+ * Test 5 – Sequential requests: verify slot reuse
  * ---------------------------------------------------------------------- */
 
 /**
- * @brief Test 5 – Five sequential submissions (wait between each).
- *
- * Verifies that slots are correctly recycled and that each result is
- * independently correct.
+ * @brief Test 5 – Five back-to-back submissions; each waits before the next.
  *
  * @param[in] worker  Initialised worker handle.
  */
@@ -311,14 +342,17 @@ static void test_sequential(async_worker_t *worker)
 
     int all_pass = 1;
     for (int i = 0; i < 5; i++) {
-        int a = i * 10, b = i, res = -1;
+        int a = i * 10, b = i;
         struct iovec params[2] = { { &a, sizeof(a) }, { &b, sizeof(b) } };
-        struct iovec result    = { &res, sizeof(res) };
 
-        async_req_id_t id = async_func(worker, fn_add, params, 2, &result);
+        async_req_id_t id = async_func(worker, fn_add, params, 2);
         if (id == ASYNC_REQ_INVALID) { all_pass = 0; break; }
 
-        async_worker_wait(worker, id);
+        poll_until_ready(worker, id);
+
+        int res = -1;
+        struct iovec out = { &res, sizeof(res) };
+        if (async_get_result(worker, id, &out) != 0) { all_pass = 0; break; }
 
         int expected = a + b;
         printf("  %2d + %d = %d  (expected %d)  ID=%u\n",
@@ -343,14 +377,14 @@ static void test_sequential(async_worker_t *worker)
 /**
  * @brief Test harness entry point.
  *
- * Creates one async_worker_t (spawns async_worker_thread + async_func_thread),
- * runs all five tests, destroys the handle, and prints a summary.
+ * Creates one async_worker_t, runs all five tests using the non-blocking
+ * poll + async_get_result() pattern, destroys the handle, and prints a summary.
  *
  * @return EXIT_SUCCESS when all assertions pass, EXIT_FAILURE otherwise.
  */
 int main(void)
 {
-    printf("=== async_func test suite (request queue) ===\n");
+    printf("=== async_func test suite (non-blocking, poll + get_result) ===\n");
 
     async_worker_t *worker = async_worker_init();
     if (!worker) {
@@ -359,8 +393,8 @@ int main(void)
     }
 
     test_single(worker);
-    test_queue_fifo(worker);
-    test_status(worker);
+    test_multi_poll(worker);
+    test_get_not_ready(worker);
     test_queue_full(worker);
     test_sequential(worker);
 

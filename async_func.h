@@ -1,70 +1,62 @@
 /**
  * @file async_func.h
- * @brief Asynchronous function dispatcher with a request queue and per-request
- *        status tracking.
+ * @brief Non-blocking async function dispatcher with a request queue and
+ *        per-request status/result retrieval by request ID.
  *
  * Architecture
  * ------------
  * The subsystem consists of two persistent threads and a shared-memory block
- * (mmap MAP_ANONYMOUS | MAP_SHARED) that holds a fixed-depth request queue:
+ * (mmap MAP_ANONYMOUS | MAP_SHARED) holding a fixed-depth request queue:
  *
- *  ┌──────────┐  async_func() ┌──────────────────┐  dispatch  ┌──────────────────┐
- *  │  Caller  │ ────────────► │ async_worker      │ ─────────► │ async_func       │
- *  │          │  req_id       │ thread            │            │ thread           │
- *  │          │ ◄──────────── │ (dispatcher)      │            │ (executor)       │
- *  └──────────┘               └──────────────────┘            └──────────────────┘
- *       │  async_worker_wait(id)                                       │
- *       └──────────────────────── waits on cond_done ◄────────────────┘
- *                                 (result in caller's buffer)
+ *  ┌──────────┐  async_func()  ┌──────────────────┐  dispatch  ┌──────────────────┐
+ *  │  Caller  │ ─────────────► │ async_worker      │ ─────────► │ async_func       │
+ *  │          │  req_id        │ thread            │            │ thread           │
+ *  │          │ ◄───────────── │ (dispatcher)      │            │ (executor)       │
+ *  └──────────┘                └──────────────────┘            └──────────────────┘
+ *       │
+ *       │  async_worker_status(id)  ──► BUSY / FREE(READY)
+ *       │
+ *       │  async_get_result(id, buf) ──► copies result, releases slot
+ *
+ * No blocking wait exists on the caller side.  The caller submits a request,
+ * receives an opaque request ID, periodically polls the status, and retrieves
+ * the result with a single non-blocking call once the status is FREE (ready).
  *
  * Request queue
  * -------------
- * The queue is a fixed array of @c ASYNC_QUEUE_DEPTH request slots.  Each slot
- * carries one execution request and progresses through these states:
+ * A fixed array of @c ASYNC_QUEUE_DEPTH request slots.  Each slot stores the
+ * function pointer, input parameters, and the execution result inline
+ * (no external allocation needed).  Slots progress through:
  *
- *   SLOT_FREE → SLOT_QUEUED → SLOT_RUNNING → SLOT_DONE → SLOT_FREE
- *
- * Each submitted request is assigned a unique @c async_req_id_t.  Callers use
- * this ID to query per-request status or to wait for a specific result.
- *
- * Concurrency model
- * -----------------
- *  - @c async_func() finds a free slot, fills it, appends its index to the
- *    FIFO queue, signals async_worker_thread, and returns the request ID
- *    immediately without blocking.
- *  - @c async_worker_thread dequeues the next slot when async_func_thread is
- *    idle, sets it to SLOT_RUNNING, and dispatches it.
- *  - @c async_func_thread executes the function, copies the result into the
- *    caller-supplied buffer, sets the slot to SLOT_DONE, and broadcasts
- *    @c cond_done to wake any @c async_worker_wait() callers.
- *  - @c async_worker_wait(id) blocks on @c cond_done until the target slot
- *    reaches SLOT_DONE, then auto-releases the slot back to SLOT_FREE.
- *  - @c async_worker_status(id) returns ASYNC_STATUS_BUSY (QUEUED or RUNNING)
- *    or ASYNC_STATUS_FREE (DONE); returns FREE for unknown IDs (already released).
+ *   SLOT_FREE → SLOT_QUEUED → SLOT_RUNNING → SLOT_DONE
+ *                                                 │
+ *                              async_get_result() releases back to SLOT_FREE
  *
  * Typical usage
  * -------------
  * @code
  *   async_worker_t *w = async_worker_init();
  *
- *   // Prepare parameters
- *   int a = 7, b = 3, res = 0;
+ *   // Prepare input parameters
+ *   int a = 7, b = 3;
  *   struct iovec params[2] = {
  *       { .iov_base = &a, .iov_len = sizeof(a) },
  *       { .iov_base = &b, .iov_len = sizeof(b) },
  *   };
- *   struct iovec result = { .iov_base = &res, .iov_len = sizeof(res) };
  *
- *   // Submit — returns immediately
- *   async_req_id_t id = async_func(w, my_add_fn, params, 2, &result);
+ *   // Submit — returns immediately with a request ID
+ *   async_req_id_t id = async_func(w, my_add_fn, params, 2);
  *   if (id == ASYNC_REQ_INVALID) { ... } // queue full
  *
- *   // Poll (non-blocking)
- *   async_status_t st = async_worker_status(w, id);  // BUSY or FREE
+ *   // Poll without blocking
+ *   while (async_worker_status(w, id) == ASYNC_STATUS_BUSY)
+ *       usleep(1000);
  *
- *   // Block until done, then release the slot
- *   async_worker_wait(w, id);
- *   printf("result = %d\n", res);   // result buffer is now populated
+ *   // Retrieve result and release the slot
+ *   int result = 0;
+ *   struct iovec out = { .iov_base = &result, .iov_len = sizeof(result) };
+ *   async_get_result(w, id, &out);
+ *   printf("result = %d\n", result);
  *
  *   async_worker_destroy(w);
  * @endcode
@@ -82,11 +74,11 @@
 
 /**
  * Maximum byte size for a single parameter slot or the result buffer.
- * Larger objects should be passed by pointer (the pointer itself fits here).
+ * Larger objects should be passed by pointer.
  */
 #define ASYNC_MAX_DATA_SIZE 4096
 
-/** Number of request slots in the queue; sets the maximum concurrency depth. */
+/** Number of request slots in the queue (maximum outstanding requests). */
 #define ASYNC_QUEUE_DEPTH   16
 
 /* -------------------------------------------------------------------------
@@ -94,34 +86,35 @@
  * ---------------------------------------------------------------------- */
 
 /**
- * @brief Per-request execution status as seen by the caller.
+ * @brief Per-request execution status.
  */
 typedef enum {
-    ASYNC_STATUS_FREE = 0, /**< Request is complete (or ID not found).       */
-    ASYNC_STATUS_BUSY = 1  /**< Request is queued or currently executing.     */
+    ASYNC_STATUS_FREE = 0, /**< Request is complete; result ready for retrieval
+                                via async_get_result().  Also returned for
+                                unknown IDs (already released or never valid). */
+    ASYNC_STATUS_BUSY = 1  /**< Request is queued or currently executing.      */
 } async_status_t;
 
 /**
  * @brief Unique identifier for a submitted async request.
  *
- * The value @c ASYNC_REQ_INVALID (0) is returned by @c async_func() when the
- * request queue is full and the submission was rejected.
+ * Assigned by async_func().  Remains valid until async_get_result() releases
+ * the slot.  @c ASYNC_REQ_INVALID (0) is returned on queue-full failure.
  */
 typedef uint32_t async_req_id_t;
 
-/** Sentinel value returned when a submission fails (queue full). */
+/** Sentinel returned by async_func() when the queue is full. */
 #define ASYNC_REQ_INVALID  ((async_req_id_t)0)
 
 /**
  * @brief Prototype for functions that can be dispatched via async_func().
  *
  * @param[in]  params   Array of @p nparams iovec structures.  iov_base points
- *                      to parameter data (in shared memory); iov_len is its
- *                      byte size.
+ *                      to parameter data in shared memory; iov_len is its size.
  * @param[in]  nparams  Number of valid entries in @p params.
- * @param[out] result   Pre-loaded with a shared-memory buffer (iov_base) of
- *                      iov_len bytes capacity.  The function writes its return
- *                      value there and updates iov_len to bytes actually written.
+ * @param[out] result   Pre-loaded with a shared-memory buffer of iov_len bytes.
+ *                      The function writes its return value there and sets
+ *                      iov_len to the number of bytes actually written.
  */
 typedef void (*async_fn_t)(struct iovec *params, int nparams,
                            struct iovec *result);
@@ -136,20 +129,20 @@ typedef struct async_worker async_worker_t;
 /**
  * @brief Initialise the async subsystem.
  *
- * Allocates the shared-memory block (holding the request queue and all POSIX
- * synchronisation objects), initialises them with PTHREAD_PROCESS_SHARED, and
- * spawns async_worker_thread (dispatcher) and async_func_thread (executor).
+ * Allocates the shared-memory block, initialises synchronisation objects with
+ * PTHREAD_PROCESS_SHARED, and spawns async_worker_thread (dispatcher) and
+ * async_func_thread (executor).
  *
  * @return Opaque handle on success, @c NULL on failure (errno set).
  */
 async_worker_t *async_worker_init(void);
 
 /**
- * @brief Destroy the async subsystem and release all resources.
+ * @brief Destroy the async subsystem and free all resources.
  *
- * Sets the shutdown flag, wakes both threads, joins them, destroys POSIX
- * objects, and unmaps the shared-memory region.  Any queued or in-progress
- * requests are abandoned; their result buffers may not be populated.
+ * Sets the shutdown flag, wakes both threads, joins them, destroys all POSIX
+ * synchronisation objects, and unmaps the shared-memory region.  Any queued
+ * or in-progress requests are abandoned.
  *
  * @param[in] worker  Handle from async_worker_init().  @c NULL is a no-op.
  */
@@ -158,30 +151,26 @@ void async_worker_destroy(async_worker_t *worker);
 /**
  * @brief Submit a function for asynchronous execution (non-blocking).
  *
- * Finds a free slot in the request queue, deep-copies the function pointer and
- * all parameter data into shared memory, and appends the slot to the FIFO.
- * Returns immediately with the assigned request ID.
+ * Finds a free slot in the request queue, deep-copies the function pointer
+ * and all parameter data into shared memory, and appends the slot to the FIFO.
+ * Returns immediately with a unique request ID; the caller is never blocked.
  *
- * The function executes asynchronously in async_func_thread.  The result is
- * written to @p result->iov_base once async_worker_wait() returns.
+ * The execution result is stored inside the slot.  Retrieve it with
+ * async_get_result() once async_worker_status() returns ASYNC_STATUS_FREE.
  *
  * @param[in]  worker   Handle from async_worker_init().
  * @param[in]  func     Function to execute; must match async_fn_t.
  * @param[in]  params   Array of @p nparams iovec descriptors.  Data is
  *                      deep-copied before this call returns.
  * @param[in]  nparams  Number of entries in @p params (0..ASYNC_MAX_PARAMS).
- * @param[out] result   Caller-allocated iovec.  iov_base must point to a buffer
- *                      of at least iov_len bytes.  Populated when the associated
- *                      async_worker_wait() call returns.  May be @c NULL.
  *
  * @return A non-zero @c async_req_id_t identifying this request, or
- *         @c ASYNC_REQ_INVALID if the queue is full.
+ *         @c ASYNC_REQ_INVALID if all @c ASYNC_QUEUE_DEPTH slots are occupied.
  */
 async_req_id_t async_func(async_worker_t *worker,
                            async_fn_t      func,
                            struct iovec   *params,
-                           int             nparams,
-                           struct iovec   *result);
+                           int             nparams);
 
 /**
  * @brief Query the execution status of a specific request (non-blocking).
@@ -190,27 +179,34 @@ async_req_id_t async_func(async_worker_t *worker,
  * @param[in] id      Request ID returned by async_func().
  *
  * @retval ASYNC_STATUS_BUSY  The request is queued or currently executing.
- * @retval ASYNC_STATUS_FREE  The request is complete, or @p id was not found
- *                            (e.g. it was already released by async_worker_wait()).
+ * @retval ASYNC_STATUS_FREE  The request is complete and its result is
+ *                            available via async_get_result(), or @p id was
+ *                            not found (already released or never valid).
  */
 async_status_t async_worker_status(async_worker_t *worker, async_req_id_t id);
 
 /**
- * @brief Block until a specific request completes, then release its slot.
+ * @brief Retrieve the result of a completed request and release its slot.
  *
- * Waits on the internal @c cond_done condition until the slot associated with
- * @p id reaches the DONE state.  On return:
- *  - The result buffer passed to the original async_func() call is fully
- *    populated.
- *  - The request slot is released back to the free pool (the ID becomes
- *    invalid; async_worker_status() will return FREE for it).
+ * Non-blocking.  Succeeds only when the request identified by @p id has
+ * reached the DONE state (i.e. async_worker_status() returned FREE).
  *
- * If @p id is not found (already released or never valid) this returns
- * immediately.
+ * On success the slot is released back to the free pool; the ID becomes
+ * invalid and subsequent calls with the same ID return -1.
  *
- * @param[in] worker  Handle from async_worker_init().
- * @param[in] id      Request ID returned by async_func().
+ * @param[in]  worker  Handle from async_worker_init().
+ * @param[in]  id      Request ID returned by async_func().
+ * @param[out] result  Caller-allocated iovec.  iov_base must point to a buffer
+ *                     of at least iov_len bytes.  On return iov_base contains
+ *                     the function's output and iov_len is set to the number of
+ *                     bytes written (capped at the original iov_len).
+ *                     May be @c NULL if the return value is not needed.
+ *
+ * @retval  0   Result copied successfully; slot released.
+ * @retval -1   Request not found, or still executing (not yet DONE).
  */
-void async_worker_wait(async_worker_t *worker, async_req_id_t id);
+int async_get_result(async_worker_t *worker,
+                     async_req_id_t  id,
+                     struct iovec   *result);
 
 #endif /* ASYNC_FUNC_H */
